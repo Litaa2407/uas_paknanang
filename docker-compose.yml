@@ -1,0 +1,52 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: crowdfunding
+      POSTGRES_USER: crowdfunding
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-this-password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crowdfunding -d crowdfunding"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  campaign-service:
+    build: ./campaign-service
+    environment:
+      PORT: 8001
+      DATABASE_URL: postgres://crowdfunding:${DB_PASSWORD:-change-this-password}@db:5432/crowdfunding?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET:-change-this-jwt-secret}
+      PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:-change-this-webhook-secret}
+      NOTIF_URL: http://notification-service:8002
+    depends_on:
+      db: { condition: service_healthy }
+  campaign-service-2:
+    build: ./campaign-service
+    environment:
+      PORT: 8001
+      DATABASE_URL: postgres://crowdfunding:${DB_PASSWORD:-change-this-password}@db:5432/crowdfunding?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET:-change-this-jwt-secret}
+      PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:-change-this-webhook-secret}
+      NOTIF_URL: http://notification-service:8002
+    depends_on:
+      db: { condition: service_healthy }
+  notification-service:
+    build: ./notification-service
+    environment: { PORT: 8002 }
+  gateway:
+    build: ./gateway
+    environment:
+      PORT: 8000
+      CAMPAIGN_SERVICES: http://campaign-service:8001,http://campaign-service-2:8001
+      NOTIFICATION_SERVICE: http://notification-service:8002
+    ports: ["8000:8000"]
+    depends_on: [campaign-service, campaign-service-2, notification-service]
+  frontend:
+    build: ./frontend
+    ports: ["5173:80"]
+    depends_on: [gateway]
+volumes:
+  pgdata:
