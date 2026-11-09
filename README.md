@@ -33,14 +33,14 @@ docker compose down
 Data PostgreSQL tetap tersimpan di volume. Untuk menghapus seluruh data demo: `docker compose down -v`.
 
 ## Akun dan role
-Registrasi publik hanya membuat role `DONATUR`. Pengguna tidak dapat memilih role `PENGELOLA` atau `ADMIN` sendiri. Untuk demo lokal, setelah mendaftar, ubah role akun melalui PostgreSQL oleh administrator:
+Registrasi publik membuat role `DONATUR`. Semua pengguna yang sudah login dapat mengajukan campaign. Campaign berstatus `MENUNGGU` dan tidak tampil dalam daftar publik sampai disetujui oleh `ADMIN`. `ADMIN` dapat meninjau dan menyetujui pengajuan dari bagian **Persetujuan Campaign** di aplikasi. Pengguna tidak dapat memilih role `PENGELOLA` atau `ADMIN` sendiri. Untuk demo lokal, role dapat diubah melalui PostgreSQL oleh administrator:
 
 ```sql
 UPDATE users SET role = 'PENGELOLA' WHERE email = 'email-pengelola@example.com';
 UPDATE users SET role = 'ADMIN' WHERE email = 'email-admin@example.com';
 ```
 
-Jangan membuka akses SQL admin kepada pengguna aplikasi. Mutasi `createCampaign` hanya untuk `PENGELOLA`/`ADMIN`; `approveCampaign` hanya untuk `ADMIN`.
+Jangan membuka akses SQL admin kepada pengguna aplikasi. Mutasi `createCampaign` memerlukan login; mutasi `approveCampaign` dan daftar `pendingCampaigns` hanya tersedia untuk `ADMIN`.
 
 ## GraphQL
 Endpoint: `POST http://localhost:8000/graphql`

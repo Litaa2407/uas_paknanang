@@ -148,18 +148,37 @@ func buildSchema() graphql.Schema {
 		}},
 		"campaign": &graphql.Field{Type: campaignType, Args: graphql.FieldConfigArgument{"id": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Int)}}, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
 			var c Campaign
-			e := db.QueryRow(p.Context, "SELECT id,title,description,target,collected,status FROM campaigns WHERE id=$1", p.Args["id"]).Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status)
+			e := db.QueryRow(p.Context, "SELECT id,title,description,target,collected,status FROM campaigns WHERE id=$1 AND status='AKTIF'", p.Args["id"]).Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status)
 			if e == sql.ErrNoRows {
 				return nil, nil
 			}
 			return c, e
 		}},
+		"pendingCampaigns": &graphql.Field{Type: graphql.NewList(campaignType), Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			if _, e := requireRole(p, "ADMIN"); e != nil {
+				return nil, e
+			}
+			rows, e := db.Query(p.Context, "SELECT id,title,description,target,collected,status FROM campaigns WHERE status='MENUNGGU' ORDER BY id")
+			if e != nil {
+				return nil, e
+			}
+			defer rows.Close()
+			out := []Campaign{}
+			for rows.Next() {
+				var c Campaign
+				if e = rows.Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status); e != nil {
+					return nil, e
+				}
+				out = append(out, c)
+			}
+			return out, rows.Err()
+		}},
 	}})
 	mutation := graphql.NewObject(graphql.ObjectConfig{Name: "Mutation", Fields: graphql.Fields{
 		"createCampaign": &graphql.Field{Type: campaignType, Args: graphql.FieldConfigArgument{"title": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)}, "description": &graphql.ArgumentConfig{Type: graphql.String}, "target": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Int)}}, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-			u, e := requireRole(p, "PENGELOLA", "ADMIN")
-			if e != nil {
-				return nil, e
+			u, ok := currentUser(p)
+			if !ok {
+				return nil, errors.New("autentikasi diperlukan")
 			}
 			title := strings.TrimSpace(p.Args["title"].(string))
 			target := p.Args["target"].(int)
@@ -168,7 +187,7 @@ func buildSchema() graphql.Schema {
 			}
 			desc, _ := p.Args["description"].(string)
 			var c Campaign
-			e = db.QueryRow(p.Context, "INSERT INTO campaigns(title,description,target,status,owner_id) VALUES($1,$2,$3,'MENUNGGU',$4) RETURNING id,title,description,target,collected,status", title, desc, target, u.ID).Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status)
+			e := db.QueryRow(p.Context, "INSERT INTO campaigns(title,description,target,status,owner_id) VALUES($1,$2,$3,'MENUNGGU',$4) RETURNING id,title,description,target,collected,status", title, desc, target, u.ID).Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status)
 			if e == nil {
 				notifyEvent(map[string]interface{}{"event": "CAMPAIGN_CREATED", "campaign": c})
 			}
