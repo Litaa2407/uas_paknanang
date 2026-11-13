@@ -1,0 +1,23 @@
+# Environment and credentials
+.env
+.env.*
+!.env.example
+
+# Local development mTLS certificates and private keys
+/certs/
+
+# Go build outputs
+**/bin/
+**/*.exe
+**/*.test
+coverage.out
+
+# Frontend dependencies/build output
+frontend/node_modules/
+frontend/dist/
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
