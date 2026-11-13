@@ -1,12 +1,14 @@
-FROM golang:1.23-alpine AS build
+FROM golang:1.27.4-alpine3.24 AS build
 WORKDIR /app
-COPY go.mod go.sum* ./
+COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /campaign .
-FROM alpine:3.20
-RUN adduser -D app
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /campaign .
+
+FROM alpine:3.24.4
+RUN addgroup -S app && adduser -S -G app app && apk add --no-cache ca-certificates
 USER app
 COPY --from=build /campaign /campaign
-EXPOSE 8001
-CMD ["/campaign"]
+EXPOSE 8443
+ENTRYPOINT ["/campaign"]
