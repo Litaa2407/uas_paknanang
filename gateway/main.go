@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -165,6 +164,9 @@ func main() {
 	// Routing ke Campaign Service
 	mux.Handle("/auth/", proxy(campaign))
 	mux.Handle("/graphql", proxy(campaign))
+	mux.Handle("/campaigns", proxy(campaign))
+	mux.Handle("/campaigns/", proxy(campaign))
+	mux.Handle("/donations/", proxy(campaign))
 	mux.Handle("/webhook/", proxy(campaign))
 
 	// Routing ke Notification Service
