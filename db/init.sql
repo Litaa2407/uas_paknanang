@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS users (
   role VARCHAR(20) NOT NULL CHECK (role IN ('DONATUR','PENGELOLA','ADMIN')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
 CREATE TABLE IF NOT EXISTS campaigns (
   id BIGSERIAL PRIMARY KEY,
   title VARCHAR(100) NOT NULL,
@@ -16,6 +17,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
   owner_id BIGINT REFERENCES users(id),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
 CREATE TABLE IF NOT EXISTS donations (
   id BIGSERIAL PRIMARY KEY,
   campaign_id BIGINT NOT NULL REFERENCES campaigns(id),
@@ -35,6 +37,19 @@ CREATE TABLE IF NOT EXISTS campaign_media (
   file_data BYTEA NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Transactional outbox: event tersimpan satu transaksi dengan perubahan bisnis.
+CREATE TABLE IF NOT EXISTS outbox_events (
+  id BIGSERIAL PRIMARY KEY,
+  event_type VARCHAR(100) NOT NULL,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  published_at TIMESTAMPTZ,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);
 CREATE INDEX IF NOT EXISTS idx_donations_created ON donations(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_campaign_media_campaign ON campaign_media(campaign_id, id);
+CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_events(id) WHERE published_at IS NULL;
