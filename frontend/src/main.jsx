@@ -7,6 +7,19 @@ const HOME_CAMPAIGNS_COUNT = 3;
 const CAMPAIGNS_PER_PAGE = 9;
 const PENDING_CAMPAIGNS_PER_PAGE = 10;
 
+function consumeOAuthRedirect() {
+  const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const token = params.get('oauth_token');
+  const error = params.get('oauth_error');
+  if (token) localStorage.setItem('token', token);
+  if (token || error) {
+    window.history.replaceState({}, document.title, `${window.location.pathname}${window.location.search}`);
+  }
+  return error ? 'Login dengan Google gagal. Silakan coba lagi atau gunakan email.' : '';
+}
+
+const oauthRedirectError = consumeOAuthRedirect();
+
 function claimsFromToken(token) {
   try {
     const payload = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
@@ -462,7 +475,7 @@ function AppContent({ showDialog }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [authMode, setAuthMode] = useState('login');
-  const [authError, setAuthError] = useState('');
+  const [authError, setAuthError] = useState(oauthRedirectError);
   const [authLoading, setAuthLoading] = useState(false);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -1362,6 +1375,20 @@ function AppContent({ showDialog }) {
                   Daftar
                 </button>
               </div>
+
+              {authMode === 'login' && (
+                <>
+                  <button
+                    className="google-login"
+                    type="button"
+                    onClick={() => window.location.assign(`${GATEWAY}/auth/google`)}
+                  >
+                    <span className="google-mark" aria-hidden="true">G</span>
+                    Masuk dengan Google
+                  </button>
+                  <div className="auth-divider"><span>atau masuk dengan email</span></div>
+                </>
+              )}
 
               <form className="auth-form" onSubmit={(event) => { event.preventDefault(); auth(authMode === 'login' ? 'login' : 'register'); }}>
                 {authMode === 'register' && (

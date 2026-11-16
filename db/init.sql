@@ -3,9 +3,13 @@ CREATE TABLE IF NOT EXISTS users (
   name VARCHAR(100) NOT NULL,
   email VARCHAR(150) UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
+  google_sub TEXT,
   role VARCHAR(20) NOT NULL CHECK (role IN ('DONATUR','PENGELOLA','ADMIN')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub_unique
+  ON users (google_sub) WHERE google_sub IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS campaigns (
   id BIGSERIAL PRIMARY KEY,

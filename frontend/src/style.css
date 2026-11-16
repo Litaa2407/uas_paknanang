@@ -190,6 +190,26 @@ button { cursor: pointer; }
   font-weight: 600;
 }
 .auth-tabs button.active { background: #fff; color: #24583d; box-shadow: 0 2px 6px #152b1d12; }
+.google-login {
+  display: flex;
+  width: 100%;
+  min-height: 46px;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: 0 0 17px;
+  border: 1px solid #e2e7e2;
+  border-radius: 9px;
+  background: #fff;
+  color: #25332a;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.google-login:hover { border-color: #bdcdbf; background: #f8faf7; }
+.google-mark { color: #4285f4; font-family: Arial, sans-serif; font-size: 19px; font-weight: 800; }
+.auth-divider { display: flex; align-items: center; gap: 12px; margin: 0 0 19px; color: #9aa39c; font-size: 10px; }
+.auth-divider::before, .auth-divider::after { height: 1px; flex: 1; background: #edf0ec; content: ''; }
 .auth-form { display: flex; flex-direction: column; }
 .auth-form label { margin: 0 0 8px; color: #35423a; font-size: 12px; font-weight: 600; }
 .auth-form input {

@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/mail"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -127,6 +129,9 @@ func main() {
 	if err := db.Ping(pingCtx); err != nil {
 		log.Fatalf("database tidak dapat diakses: %v", err)
 	}
+	if err := ensureGoogleOAuthSchema(ctx, db); err != nil {
+		log.Fatalf("gagal menyiapkan skema Google OAuth: %v", err)
+	}
 	if err := ensureOutboxSchema(ctx, db); err != nil {
 		log.Fatalf("gagal menyiapkan tabel outbox: %v", err)
 	}
@@ -150,6 +155,8 @@ func main() {
 	mux.HandleFunc("POST /oauth/token", oauthToken)
 	mux.HandleFunc("POST /auth/register", register)
 	mux.HandleFunc("POST /auth/login", login)
+	mux.HandleFunc("GET /auth/google", googleLogin)
+	mux.HandleFunc("GET /auth/google/callback", googleCallback)
 	mux.Handle("POST /campaigns", authMiddleware(http.HandlerFunc(createCampaignWithMedia)))
 	mux.Handle("POST /campaigns/{campaignID}/media", authMiddleware(http.HandlerFunc(uploadCampaignMedia)))
 	mux.Handle("POST /campaigns/{campaignID}/fund-updates", authMiddleware(http.HandlerFunc(createCampaignFundUpdate)))
@@ -162,30 +169,7 @@ func main() {
 	mux.Handle("POST /donations/simulate", authMiddleware(http.HandlerFunc(simulateDonation)))
 	mux.HandleFunc("POST /webhook/midtrans", midtransPaymentWebhook)
 	mux.Handle("GET /campaigns/{campaignID}/media/{mediaID}", authMiddleware(http.HandlerFunc(serveCampaignMedia)))
-	mux.Handle("POST /graphql", authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Query         string                 `json:"query"`
-			Variables     map[string]interface{} `json:"variables"`
-			OperationName string                 `json:"operationName"`
-		}
-		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-		if err := decoder.Decode(&req); err != nil || strings.TrimSpace(req.Query) == "" {
-			http.Error(w, "request GraphQL tidak valid", http.StatusBadRequest)
-			return
-		}
-		if strings.Count(req.Query, "{") > 12 {
-			http.Error(w, "query terlalu kompleks", http.StatusBadRequest)
-			return
-		}
-		result := graphql.Do(graphql.Params{
-			Schema:         schema,
-			RequestString:  req.Query,
-			VariableValues: req.Variables,
-			OperationName:  req.OperationName,
-			Context:        r.Context(),
-		})
-		writeJSON(w, http.StatusOK, result)
-	})))
+	mux.Handle("/graphql", graphQLHandler(schema))
 	mux.HandleFunc("POST /webhook/payment", paymentWebhook)
 
 	handler := securityHeaders(requireMTLS(internalAuthMiddleware(mux)))
@@ -1003,6 +987,74 @@ func currentUser(p graphql.ResolveParams) (User, bool) {
 	return u, ok
 }
 
+func graphQLHandler(schema graphql.Schema) http.Handler {
+	return authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Query         string                 `json:"query"`
+			Variables     map[string]interface{} `json:"variables"`
+			OperationName string                 `json:"operationName"`
+		}
+
+		switch r.Method {
+		case http.MethodPost:
+			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+			if err := decoder.Decode(&request); err != nil {
+				http.Error(w, "request GraphQL tidak valid", http.StatusBadRequest)
+				return
+			}
+		case http.MethodGet:
+			query := r.URL.Query()
+			request.Query = query.Get("query")
+			request.OperationName = query.Get("operationName")
+			if rawVariables := query.Get("variables"); rawVariables != "" {
+				if err := json.Unmarshal([]byte(rawVariables), &request.Variables); err != nil {
+					http.Error(w, "variables GraphQL tidak valid", http.StatusBadRequest)
+					return
+				}
+			}
+			if isGraphQLMutation(request.Query) {
+				http.Error(w, "mutation GraphQL harus menggunakan POST", http.StatusMethodNotAllowed)
+				return
+			}
+		default:
+			w.Header().Set("Allow", "GET, POST")
+			http.Error(w, "method tidak diizinkan", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if strings.TrimSpace(request.Query) == "" {
+			http.Error(w, "query GraphQL wajib diisi", http.StatusBadRequest)
+			return
+		}
+		if strings.Count(request.Query, "{") > 12 {
+			http.Error(w, "query terlalu kompleks", http.StatusBadRequest)
+			return
+		}
+
+		result := graphql.Do(graphql.Params{
+			Schema:         schema,
+			RequestString:  request.Query,
+			VariableValues: request.Variables,
+			OperationName:  request.OperationName,
+			Context:        r.Context(),
+		})
+		writeJSON(w, http.StatusOK, result)
+	}))
+}
+
+func isGraphQLMutation(query string) bool {
+	var lines []string
+	for _, line := range strings.Split(query, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	// Reject any mutation operation in a GET document, including multi-operation documents.
+	return strings.Contains(strings.Join(lines, " "), "mutation")
+}
+
 func requireRole(p graphql.ResolveParams, roles ...string) (User, error) {
 	u, ok := currentUser(p)
 	if !ok {
@@ -1090,7 +1142,266 @@ func login(w http.ResponseWriter, r *http.Request) {
 	respondToken(w, u)
 }
 
+type googleUserProfile struct {
+	Sub           string `json:"sub"`
+	Name          string `json:"name"`
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"email_verified"`
+}
+
+func googleLogin(w http.ResponseWriter, r *http.Request) {
+	clientID := strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_ID"))
+	redirectURL := strings.TrimSpace(os.Getenv("GOOGLE_REDIRECT_URL"))
+	if clientID == "" || strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_SECRET")) == "" || redirectURL == "" {
+		redirectGoogleError(w, r)
+		return
+	}
+
+	stateBytes := make([]byte, 32)
+	if _, err := rand.Read(stateBytes); err != nil {
+		http.Error(w, "tidak dapat memulai autentikasi Google", http.StatusInternalServerError)
+		return
+	}
+	state := base64.RawURLEncoding.EncodeToString(stateBytes)
+	http.SetCookie(w, &http.Cookie{
+		Name:     "google_oauth_state",
+		Value:    state,
+		Path:     "/auth/google/callback",
+		MaxAge:   600,
+		HttpOnly: true,
+		Secure:   strings.EqualFold(os.Getenv("GOOGLE_COOKIE_SECURE"), "true"),
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	params := url.Values{}
+	params.Set("client_id", clientID)
+	params.Set("redirect_uri", redirectURL)
+	params.Set("response_type", "code")
+	params.Set("scope", "openid email profile")
+	params.Set("state", state)
+	params.Set("prompt", "select_account")
+	params.Set("access_type", "online")
+	http.Redirect(w, r, "https://accounts.google.com/o/oauth2/v2/auth?"+params.Encode(), http.StatusFound)
+}
+
+func googleCallback(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("error") != "" {
+		clearGoogleStateCookie(w)
+		redirectGoogleError(w, r)
+		return
+	}
+
+	stateCookie, err := r.Cookie("google_oauth_state")
+	state := r.URL.Query().Get("state")
+	if err != nil || state == "" || subtle.ConstantTimeCompare([]byte(stateCookie.Value), []byte(state)) != 1 {
+		clearGoogleStateCookie(w)
+		redirectGoogleError(w, r)
+		return
+	}
+	clearGoogleStateCookie(w)
+
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	clientID := strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_ID"))
+	clientSecret := strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_SECRET"))
+	redirectURL := strings.TrimSpace(os.Getenv("GOOGLE_REDIRECT_URL"))
+	if code == "" || clientID == "" || clientSecret == "" || redirectURL == "" {
+		redirectGoogleError(w, r)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	accessToken, err := exchangeGoogleCode(ctx, code, clientID, clientSecret, redirectURL)
+	if err != nil {
+		log.Printf("Google OAuth code exchange gagal: %v", err)
+		redirectGoogleError(w, r)
+		return
+	}
+
+	profile, err := fetchGoogleUserProfile(ctx, accessToken)
+	if err != nil || !profile.EmailVerified || strings.TrimSpace(profile.Sub) == "" {
+		log.Printf("verifikasi profil Google gagal")
+		redirectGoogleError(w, r)
+		return
+	}
+
+	user, err := findOrCreateGoogleUser(ctx, profile)
+	if err != nil {
+		log.Printf("pembuatan akun Google gagal: %v", err)
+		redirectGoogleError(w, r)
+		return
+	}
+
+	signedToken, err := createUserToken(user)
+	if err != nil {
+		log.Printf("pembuatan token login Google gagal: %v", err)
+		redirectGoogleError(w, r)
+		return
+	}
+	redirectGoogleToken(w, r, signedToken)
+}
+
+func exchangeGoogleCode(ctx context.Context, code, clientID, clientSecret, redirectURL string) (string, error) {
+	values := url.Values{}
+	values.Set("code", code)
+	values.Set("client_id", clientID)
+	values.Set("client_secret", clientSecret)
+	values.Set("redirect_uri", redirectURL)
+	values.Set("grant_type", "authorization_code")
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(values.Encode()))
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response, err := (&http.Client{Timeout: 10 * time.Second}).Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", errors.New("Google token endpoint menolak authorization code")
+	}
+	var tokenResponse struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&tokenResponse); err != nil {
+		return "", err
+	}
+	if tokenResponse.AccessToken == "" || !strings.EqualFold(tokenResponse.TokenType, "Bearer") {
+		return "", errors.New("respons token Google tidak valid")
+	}
+	return tokenResponse.AccessToken, nil
+}
+
+func fetchGoogleUserProfile(ctx context.Context, accessToken string) (googleUserProfile, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://openidconnect.googleapis.com/v1/userinfo", nil)
+	if err != nil {
+		return googleUserProfile{}, err
+	}
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	response, err := (&http.Client{Timeout: 10 * time.Second}).Do(request)
+	if err != nil {
+		return googleUserProfile{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return googleUserProfile{}, errors.New("Google UserInfo endpoint menolak access token")
+	}
+	var profile googleUserProfile
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&profile); err != nil {
+		return googleUserProfile{}, err
+	}
+	return profile, nil
+}
+
+func findOrCreateGoogleUser(ctx context.Context, profile googleUserProfile) (User, error) {
+	email := strings.ToLower(strings.TrimSpace(profile.Email))
+	parsedEmail, emailErr := mail.ParseAddress(email)
+	if strings.TrimSpace(profile.Sub) == "" || len(email) > 150 || emailErr != nil || parsedEmail.Address != email || !profile.EmailVerified {
+		return User{}, errors.New("identitas Google tidak valid atau email belum terverifikasi")
+	}
+
+	var user User
+	var existingGoogleSub string
+	err := db.QueryRow(ctx, `SELECT id,name,email,role,COALESCE(google_sub,'') FROM users WHERE google_sub=$1`, profile.Sub).
+		Scan(&user.ID, &user.Name, &user.Email, &user.Role, &existingGoogleSub)
+	if err == nil {
+		return user, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return User{}, err
+	}
+
+	err = db.QueryRow(ctx, `SELECT id,name,email,role,COALESCE(google_sub,'') FROM users WHERE email=$1`, email).
+		Scan(&user.ID, &user.Name, &user.Email, &user.Role, &existingGoogleSub)
+	if err == nil {
+		if existingGoogleSub != "" && existingGoogleSub != profile.Sub {
+			return User{}, errors.New("email sudah terhubung ke akun Google lain")
+		}
+		if existingGoogleSub == "" {
+			err = db.QueryRow(ctx, `UPDATE users SET google_sub=$1 WHERE id=$2 AND (google_sub IS NULL OR google_sub='') RETURNING id,name,email,role`, profile.Sub, user.ID).
+				Scan(&user.ID, &user.Name, &user.Email, &user.Role)
+			if err != nil {
+				return User{}, err
+			}
+		}
+		return user, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return User{}, err
+	}
+
+	name := strings.TrimSpace(profile.Name)
+	if name == "" {
+		name = strings.SplitN(email, "@", 2)[0]
+	}
+	if runes := []rune(name); len(runes) > 100 {
+		name = string(runes[:100])
+	}
+	passwordBytes := make([]byte, 48)
+	if _, err := rand.Read(passwordBytes); err != nil {
+		return User{}, err
+	}
+	passwordHash, err := bcrypt.GenerateFromPassword(passwordBytes, bcrypt.DefaultCost)
+	if err != nil {
+		return User{}, err
+	}
+	err = db.QueryRow(ctx, `INSERT INTO users(name,email,password_hash,role,google_sub) VALUES($1,$2,$3,'DONATUR',$4) RETURNING id,name,email,role`, name, email, string(passwordHash), profile.Sub).
+		Scan(&user.ID, &user.Name, &user.Email, &user.Role)
+	if err == nil {
+		return user, nil
+	}
+
+	// Handle a concurrent first login without creating duplicate accounts.
+	if userErr := db.QueryRow(ctx, `SELECT id,name,email,role FROM users WHERE google_sub=$1`, profile.Sub).
+		Scan(&user.ID, &user.Name, &user.Email, &user.Role); userErr == nil {
+		return user, nil
+	}
+	return User{}, err
+}
+
+func clearGoogleStateCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "google_oauth_state",
+		Value:    "",
+		Path:     "/auth/google/callback",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   strings.EqualFold(os.Getenv("GOOGLE_COOKIE_SECURE"), "true"),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func redirectGoogleToken(w http.ResponseWriter, r *http.Request, token string) {
+	target, err := url.Parse(strings.TrimSpace(os.Getenv("FRONTEND_URL")))
+	if err != nil || target.Scheme == "" || target.Host == "" {
+		target, _ = url.Parse("http://localhost:5173")
+	}
+	target.Fragment = "oauth_token=" + token
+	http.Redirect(w, r, target.String(), http.StatusSeeOther)
+}
+
+func redirectGoogleError(w http.ResponseWriter, r *http.Request) {
+	target, err := url.Parse(strings.TrimSpace(os.Getenv("FRONTEND_URL")))
+	if err != nil || target.Scheme == "" || target.Host == "" {
+		target, _ = url.Parse("http://localhost:5173")
+	}
+	target.Fragment = "oauth_error=google_login_failed"
+	http.Redirect(w, r, target.String(), http.StatusSeeOther)
+}
+
 func respondToken(w http.ResponseWriter, u User) {
+	signed, err := createUserToken(u)
+	if err != nil {
+		http.Error(w, "gagal membuat token", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"token": signed, "token_type": "Bearer", "expires_in": 43200, "user": u})
+}
+
+func createUserToken(u User) (string, error) {
 	now := time.Now()
 	claims := jwt.MapClaims{
 		"iss":   userTokenIssuer,
@@ -1105,10 +1416,9 @@ func respondToken(w http.ResponseWriter, u User) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := token.SignedString(jwtSecret)
 	if err != nil {
-		http.Error(w, "gagal membuat token", http.StatusInternalServerError)
-		return
+		return "", err
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"token": signed, "token_type": "Bearer", "expires_in": 43200, "user": u})
+	return signed, nil
 }
 
 func authMiddleware(next http.Handler) http.Handler {

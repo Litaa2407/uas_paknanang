@@ -9,9 +9,65 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
+
+func TestGoogleLoginRedirect(t *testing.T) {
+	t.Setenv("GOOGLE_CLIENT_ID", "test-google-client-id")
+	t.Setenv("GOOGLE_CLIENT_SECRET", "test-google-client-secret")
+	t.Setenv("GOOGLE_REDIRECT_URL", "http://localhost:5173/auth/google/callback")
+	t.Setenv("GOOGLE_COOKIE_SECURE", "false")
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/auth/google", nil)
+	googleLogin(recorder, request)
+
+	if recorder.Code != http.StatusFound {
+		t.Fatalf("googleLogin status = %d, want %d", recorder.Code, http.StatusFound)
+	}
+	location, err := url.Parse(recorder.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("invalid Google redirect URL: %v", err)
+	}
+	if location.Host != "accounts.google.com" {
+		t.Fatalf("redirect host = %q, want accounts.google.com", location.Host)
+	}
+	if location.Query().Get("client_id") != "test-google-client-id" || location.Query().Get("response_type") != "code" {
+		t.Fatal("Google authorization request is missing required parameters")
+	}
+	if location.Query().Get("state") == "" {
+		t.Fatal("Google authorization request must include state")
+	}
+	cookies := recorder.Result().Cookies()
+	if len(cookies) == 0 || cookies[0].Name != "google_oauth_state" || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
+		t.Fatal("Google OAuth state cookie is missing required security attributes")
+	}
+}
+
+func TestGraphQLGetRejectsMutation(t *testing.T) {
+	handler := graphQLHandler(buildSchema())
+	request := httptest.NewRequest(http.MethodGet, "/graphql?query=mutation%20%7B%20createCampaign%20%7D", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET mutation status = %d, want %d", recorder.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestGraphQLGetSupportsQuery(t *testing.T) {
+	handler := graphQLHandler(buildSchema())
+	request := httptest.NewRequest(http.MethodGet, "/graphql?query=%7B__typename%7D", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET query status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if !strings.Contains(recorder.Body.String(), "Query") {
+		t.Fatalf("GET query response does not contain GraphQL root type: %s", recorder.Body.String())
+	}
+}
 
 func TestMapMidtransStatus(t *testing.T) {
 	tests := []struct {
