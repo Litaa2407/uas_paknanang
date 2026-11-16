@@ -103,6 +103,8 @@ Jangan membuka akses SQL admin kepada pengguna aplikasi. Mutasi `createCampaign`
 ## GraphQL
 Endpoint: `POST /graphql` melalui frontend/Gateway.
 
+Dokumentasi API interaktif (Swagger UI) tersedia pada `/docs/` setelah frontend dideploy. Spesifikasi OpenAPI sumbernya ada di [frontend/public/openapi.yaml](./frontend/public/openapi.yaml). Karena GraphQL tidak sepenuhnya terwakili dalam OpenAPI, dokumentasinya juga mencantumkan contoh operasi GraphQL.
+
 Query campaign publik (aktif dan yang sudah mencapai target):
 
 ```graphql

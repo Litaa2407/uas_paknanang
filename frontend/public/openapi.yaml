@@ -1,0 +1,773 @@
+openapi: 3.1.0
+info:
+  title: Crowdfunding dan Donasi API
+  version: 1.0.0
+  description: |
+    Kontrak HTTP publik untuk aplikasi Crowdfunding dan Donasi. API mencakup endpoint
+    REST serta endpoint GraphQL (`POST /graphql`); detail operasi GraphQL dijelaskan
+    sebagai contoh request karena schema GraphQL adalah kontrak utamanya.
+
+    Autentikasi pengguna memakai `Authorization: Bearer <JWT>`. Token berlaku 12 jam.
+    Error HTTP umumnya mengembalikan pesan sebagai `text/plain`. WebSocket notifikasi
+    tersedia pada `GET /ws/donasi` dan tidak dapat dicoba melalui OpenAPI.
+servers:
+  - url: /
+    description: Origin yang sama dengan frontend; API diteruskan ke Gateway.
+tags:
+  - name: Health
+  - name: Auth
+  - name: GraphQL
+  - name: Campaign
+  - name: Donation
+  - name: Webhook
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check Gateway
+      operationId: getHealth
+      responses:
+        "200":
+          description: Gateway tersedia
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  service: { type: string, example: gateway }
+              example:
+                status: ok
+                service: gateway
+  /registry:
+    get:
+      tags: [Health]
+      summary: Status service backend
+      operationId: getRegistry
+      responses:
+        "200":
+          description: Status health Campaign Service dan Notification Service
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  campaign:
+                    type: object
+                    additionalProperties:
+                      type: boolean
+                  notification:
+                    type: object
+                    additionalProperties:
+                      type: boolean
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Registrasi akun Donatur
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "200":
+          description: Akun dibuat dan JWT diterbitkan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login pengguna
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Login berhasil dan JWT diterbitkan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /graphql:
+    post:
+      tags: [GraphQL]
+      summary: Menjalankan query atau mutation GraphQL
+      operationId: executeGraphQL
+      description: |
+        Query `campaigns` dan `campaign` dapat diakses publik. Operasi lain mungkin
+        memerlukan JWT dan/atau role tertentu. GraphQL dapat mengembalikan HTTP 200
+        dengan array `errors`; periksa isi response, bukan hanya status HTTP.
+        Body maksimal 1 MiB dan kedalaman selection set dibatasi.
+      security:
+        - bearerAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GraphQLRequest"
+            examples:
+              publicCampaigns:
+                summary: Daftar campaign publik
+                value:
+                  query: "query { campaigns { id title description target collected status } }"
+              campaignDetail:
+                summary: Detail campaign
+                value:
+                  query: "query Campaign($id: Int!) { campaign(id: $id) { id title description target collected status donorCount } }"
+                  variables:
+                    id: 1
+      responses:
+        "200":
+          description: Hasil GraphQL; mungkin berisi data dan/atau errors
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraphQLResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /campaigns:
+    post:
+      tags: [Campaign]
+      summary: Buat campaign beserta media
+      operationId: createCampaignWithMedia
+      description: Pengguna terautentikasi. Campaign baru berstatus MENUNGGU.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/CreateCampaignRequest"
+      responses:
+        "201":
+          description: Campaign berhasil dibuat
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Campaign"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+  /campaigns/{campaignID}/media:
+    post:
+      tags: [Campaign]
+      summary: Tambahkan media pada campaign menunggu
+      operationId: uploadCampaignMedia
+      description: Pemilik campaign atau ADMIN; campaign harus berstatus MENUNGGU.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CampaignID"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/CampaignMediaUploadRequest"
+      responses:
+        "201":
+          description: Media berhasil ditambahkan
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uploaded: { type: integer, minimum: 1 }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+  /campaigns/{campaignID}/media/{mediaID}:
+    get:
+      tags: [Campaign]
+      summary: Ambil foto atau video campaign
+      operationId: getCampaignMedia
+      description: Media campaign aktif/selesai publik; campaign lain memerlukan akses pemilik atau ADMIN.
+      security:
+        - bearerAuth: []
+        - {}
+      parameters:
+        - $ref: "#/components/parameters/CampaignID"
+        - name: mediaID
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Konten media
+          content:
+            image/jpeg: { schema: { type: string, format: binary } }
+            image/png: { schema: { type: string, format: binary } }
+            image/webp: { schema: { type: string, format: binary } }
+            video/mp4: { schema: { type: string, format: binary } }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /campaigns/{campaignID}/fund-updates:
+    post:
+      tags: [Campaign]
+      summary: Catat penggunaan dana
+      operationId: createFundUpdate
+      description: Pemilik dengan role PENGELOLA atau ADMIN; campaign harus aktif. Maksimum request 6 MiB.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CampaignID"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/FundUpdateRequest"
+      responses:
+        "201":
+          description: Update penggunaan dana tersimpan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FundUpdate"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+  /campaigns/{campaignID}/fund-updates/{updateID}/evidence:
+    get:
+      tags: [Campaign]
+      summary: Ambil foto bukti penggunaan dana
+      operationId: getFundUpdateEvidence
+      description: Bukti campaign aktif/selesai bersifat publik; campaign lain hanya dapat diakses pemilik atau ADMIN.
+      security:
+        - bearerAuth: []
+        - {}
+      parameters:
+        - $ref: "#/components/parameters/CampaignID"
+        - name: updateID
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Foto bukti
+          content:
+            image/jpeg: { schema: { type: string, format: binary } }
+            image/png: { schema: { type: string, format: binary } }
+            image/webp: { schema: { type: string, format: binary } }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /donations:
+    post:
+      tags: [Donation]
+      summary: Buat pembayaran Midtrans Snap
+      operationId: createDonation
+      description: Hanya DONATUR; nominal minimum Rp 1.000 dan tidak boleh melampaui sisa target.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDonationRequest"
+      responses:
+        "201":
+          description: Pembayaran pending dibuat
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DonationCheckout"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+  /donations/mine:
+    get:
+      tags: [Donation]
+      summary: Riwayat dan progres donasi milik sendiri
+      operationId: getMyDonations
+      description: Hanya DONATUR; data hanya berisi transaksi milik akun yang sedang login.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Daftar donasi dan progres campaign
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [donations]
+                properties:
+                  donations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DonorDonationProgress"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /donations/pending:
+    get:
+      tags: [Donation]
+      summary: Daftar checkout pending milik sendiri
+      operationId: getPendingDonations
+      description: Maksimal lima transaksi pending untuk campaign yang ditentukan.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: campaign_id
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Checkout yang dapat dilanjutkan
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [payments]
+                properties:
+                  payments:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PendingDonation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /donations/{reference}/status:
+    get:
+      tags: [Donation]
+      summary: Periksa status pembayaran
+      operationId: getDonationStatus
+      description: Hanya pemilik transaksi dengan role DONATUR.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/DonationReference"
+      responses:
+        "200":
+          description: Status transaksi yang diverifikasi
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DonationStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /donations/{reference}/cancel:
+    post:
+      tags: [Donation]
+      summary: Batalkan checkout pending
+      operationId: cancelDonation
+      description: Hanya pemilik transaksi dengan role DONATUR. Pembayaran yang sudah settlement tidak dibatalkan.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/DonationReference"
+      responses:
+        "200":
+          description: Status terbaru transaksi
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DonationStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /donations/simulate:
+    post:
+      tags: [Donation]
+      summary: Catat donasi simulasi
+      operationId: simulateDonation
+      description: Untuk pengujian; hanya DONATUR. Campaign harus aktif dan nominal minimal Rp 1.000.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDonationRequest"
+      responses:
+        "200":
+          description: Donasi simulasi dicatat
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: simulated }
+                  reference: { type: string, example: SIM-0123456789abcdef }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /webhook/midtrans:
+    post:
+      tags: [Webhook]
+      summary: Terima notifikasi transaksi Midtrans Sandbox
+      operationId: midtransWebhook
+      description: Midtrans mengirim signature_key; server memverifikasi signature dan mengecek status langsung ke provider.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MidtransNotification"
+      responses:
+        "200":
+          description: Notifikasi terverifikasi
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+  /webhook/payment:
+    post:
+      tags: [Webhook]
+      summary: Webhook pembayaran simulasi
+      operationId: simulatedPaymentWebhook
+      description: |
+        Endpoint simulasi internal. Header `X-Signature` adalah HMAC-SHA256 hex
+        dari raw request body menggunakan `PAYMENT_WEBHOOK_SECRET`.
+      parameters:
+        - name: X-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+            description: HMAC-SHA256 hex dari raw body
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SimulatedPaymentWebhook"
+      responses:
+        "202":
+          description: Event diterima untuk diproses
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: accepted }
+                  message: { type: string, example: event akan diproses secara asinkron }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    CampaignID:
+      name: campaignID
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    DonationReference:
+      name: reference
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 50
+  responses:
+    BadRequest:
+      description: Request tidak valid
+      content:
+        text/plain:
+          schema: { type: string }
+    Unauthorized:
+      description: Token atau signature tidak valid
+      content:
+        text/plain:
+          schema: { type: string }
+    Forbidden:
+      description: Role atau akses tidak diizinkan
+      content:
+        text/plain:
+          schema: { type: string }
+    NotFound:
+      description: Resource tidak ditemukan
+      content:
+        text/plain:
+          schema: { type: string }
+    Conflict:
+      description: Konflik data atau status
+      content:
+        text/plain:
+          schema: { type: string }
+    PayloadTooLarge:
+      description: Ukuran request melebihi batas
+      content:
+        text/plain:
+          schema: { type: string }
+    ServiceUnavailable:
+      description: Service atau provider belum tersedia
+      content:
+        text/plain:
+          schema: { type: string }
+    BadGateway:
+      description: Gagal menghubungi atau memverifikasi provider
+      content:
+        text/plain:
+          schema: { type: string }
+  schemas:
+    User:
+      type: object
+      required: [id, name, email, role]
+      properties:
+        id: { type: integer, format: int64, example: 1 }
+        name: { type: string, example: Donatur Uji }
+        email: { type: string, format: email, example: donatur@example.com }
+        role:
+          type: string
+          enum: [DONATUR, PENGELOLA, ADMIN]
+    RegisterRequest:
+      type: object
+      required: [name, email, password]
+      properties:
+        name: { type: string, minLength: 2, maxLength: 100 }
+        email: { type: string, format: email, maxLength: 150 }
+        password: { type: string, minLength: 10, maxLength: 72, format: password }
+        role:
+          type: string
+          description: Diabaikan; akun publik selalu dibuat sebagai DONATUR.
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 150 }
+        password: { type: string, maxLength: 72, format: password }
+    AuthResponse:
+      type: object
+      required: [token, token_type, expires_in, user]
+      properties:
+        token: { type: string, description: JWT access token }
+        token_type: { type: string, const: Bearer }
+        expires_in: { type: integer, example: 43200 }
+        user: { $ref: "#/components/schemas/User" }
+    GraphQLRequest:
+      type: object
+      required: [query]
+      properties:
+        query: { type: string }
+        variables:
+          type: object
+          additionalProperties: true
+        operationName: { type: string }
+    GraphQLResponse:
+      type: object
+      properties:
+        data:
+          type: [object, "null"]
+          additionalProperties: true
+        errors:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    Campaign:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        title: { type: string }
+        description: { type: string }
+        target: { type: integer, format: int64 }
+        collected: { type: integer, format: int64 }
+        status:
+          type: string
+          enum: [MENUNGGU, AKTIF, SELESAI, DITOLAK]
+    CreateCampaignRequest:
+      type: object
+      required: [title, target, photos]
+      properties:
+        title: { type: string, minLength: 3, maxLength: 100 }
+        description: { type: string, maxLength: 10000 }
+        target: { type: integer, format: int64, minimum: 1 }
+        photos:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items:
+            type: string
+            format: binary
+            description: JPG, PNG, atau WebP, maksimal 5 MiB per foto.
+        video:
+          type: string
+          format: binary
+          description: Opsional; MP4 maksimal 25 MiB.
+    CampaignMediaUploadRequest:
+      type: object
+      required: [photos]
+      properties:
+        photos:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items: { type: string, format: binary }
+        video:
+          type: string
+          format: binary
+          description: Opsional; MP4 maksimal 25 MiB.
+    FundUpdateRequest:
+      type: object
+      required: [amount, purpose, description]
+      properties:
+        amount: { type: integer, format: int64, minimum: 1 }
+        purpose: { type: string, minLength: 3, maxLength: 120 }
+        description: { type: string, minLength: 5, maxLength: 2000 }
+        evidence:
+          type: string
+          format: binary
+          description: Opsional; satu foto JPG, PNG, atau WebP, maksimal 5 MiB.
+    FundUpdate:
+      type: object
+      properties:
+        ID: { type: integer, format: int64 }
+        Amount: { type: integer, format: int64 }
+        Purpose: { type: string }
+        Description: { type: string }
+        CreatedByName: { type: string }
+        CreatedAt: { type: string }
+        HasEvidence: { type: boolean }
+        EvidenceContentType: { type: string }
+    CreateDonationRequest:
+      type: object
+      required: [campaign_id, amount, donor_name, donor_email, donor_phone]
+      properties:
+        campaign_id: { type: integer, minimum: 1 }
+        amount: { type: integer, minimum: 1000, maximum: 100000000000 }
+        donor_name: { type: string, minLength: 2, maxLength: 100 }
+        donor_email: { type: string, format: email, maxLength: 150 }
+        donor_phone:
+          type: string
+          maxLength: 30
+          description: Format nomor telepon didukung dan divalidasi server.
+    DonationCheckout:
+      type: object
+      properties:
+        status: { type: string, const: PENDING }
+        reference: { type: string, example: DON-0123456789abcdef0123456789abcdef }
+        redirect_url: { type: string, format: uri }
+    DonationStatus:
+      type: object
+      properties:
+        reference: { type: string }
+        status: { type: string, enum: [PENDING, SETTLEMENT, FAILED] }
+        amount: { type: integer, format: int64 }
+    PendingDonation:
+      type: object
+      properties:
+        reference: { type: string }
+        amount: { type: integer, format: int64 }
+        redirect_url: { type: string, format: uri }
+    DonorDonationProgress:
+      type: object
+      properties:
+        reference: { type: string }
+        campaign_id: { type: integer, format: int64 }
+        campaign_title: { type: string }
+        amount: { type: integer, format: int64 }
+        status: { type: string, enum: [PENDING, SETTLEMENT, FAILED] }
+        created_at: { type: string }
+        target: { type: integer, format: int64 }
+        collected: { type: integer, format: int64 }
+    MidtransNotification:
+      type: object
+      required: [order_id, status_code, gross_amount, signature_key]
+      properties:
+        order_id: { type: string }
+        status_code: { type: string }
+        gross_amount: { type: string }
+        signature_key: { type: string }
+        transaction_status: { type: string }
+    SimulatedPaymentWebhook:
+      type: object
+      required: [campaign_id, donor_name, amount, reference, status]
+      properties:
+        campaign_id: { type: integer, minimum: 1 }
+        donor_name: { type: string, minLength: 1, maxLength: 60 }
+        amount: { type: integer, minimum: 1 }
+        reference: { type: string, minLength: 1, maxLength: 120 }
+        status: { type: string, enum: [PENDING, SETTLEMENT, FAILED] }

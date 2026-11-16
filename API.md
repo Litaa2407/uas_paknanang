@@ -4,6 +4,8 @@
 **Base URL lokal:** `http://localhost:8000` (API Gateway)  
 **Format:** JSON untuk HTTP; GraphQL untuk data campaign; WebSocket untuk notifikasi.
 
+Spesifikasi OpenAPI tersedia di [`frontend/public/openapi.yaml`](./frontend/public/openapi.yaml). Swagger UI interaktif disajikan frontend pada `/docs/` setelah frontend dibangun dan dideploy.
+
 Semua request browser diarahkan melalui API Gateway. Campaign Service dan Notification Service tidak mempublikasikan port ke host. Gateway berkomunikasi dengan keduanya menggunakan mTLS dan OAuth2 Client Credentials.
 
 ## 1. Ringkasan endpoint publik
