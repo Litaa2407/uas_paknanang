@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,15 +18,13 @@ import (
 	"net/http"
 	"net/mail"
 	"os"
-<<<<<<< HEAD
-=======
 	"os/signal"
->>>>>>> 968f0cd15ad87da8ddedc6237390d4e90e17b000
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/graphql-go/graphql"
@@ -56,12 +55,16 @@ type User struct {
 }
 
 type Campaign struct {
-	ID          int64  `json:"id"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Target      int64  `json:"target"`
-	Collected   int64  `json:"collected"`
-	Status      string `json:"status"`
+	ID               int64           `json:"id"`
+	Title            string          `json:"title"`
+	Description      string          `json:"description"`
+	Target           int64           `json:"target"`
+	Collected        int64           `json:"collected"`
+	Status           string          `json:"status"`
+	SubmittedByName  string          `json:"submittedByName"`
+	SubmittedByEmail string          `json:"submittedByEmail"`
+	CreatedAt        string          `json:"createdAt"`
+	Media            []CampaignMedia `json:"-"`
 }
 type CampaignMedia struct {
 	ID          string `json:"id"`
@@ -127,6 +130,12 @@ func main() {
 	if err := ensureOutboxSchema(ctx, db); err != nil {
 		log.Fatalf("gagal menyiapkan tabel outbox: %v", err)
 	}
+	if err := ensureCampaignEngagementSchema(ctx, db); err != nil {
+		log.Fatalf("gagal menyiapkan tabel pertanyaan dan update dana: %v", err)
+	}
+	if err := ensureMidtransSchema(ctx, db); err != nil {
+		log.Fatalf("gagal menyiapkan skema pembayaran: %v", err)
+	}
 
 	var workerWG sync.WaitGroup
 	workerWG.Add(1)
@@ -141,6 +150,18 @@ func main() {
 	mux.HandleFunc("POST /oauth/token", oauthToken)
 	mux.HandleFunc("POST /auth/register", register)
 	mux.HandleFunc("POST /auth/login", login)
+	mux.Handle("POST /campaigns", authMiddleware(http.HandlerFunc(createCampaignWithMedia)))
+	mux.Handle("POST /campaigns/{campaignID}/media", authMiddleware(http.HandlerFunc(uploadCampaignMedia)))
+	mux.Handle("POST /campaigns/{campaignID}/fund-updates", authMiddleware(http.HandlerFunc(createCampaignFundUpdate)))
+	mux.Handle("GET /campaigns/{campaignID}/fund-updates/{updateID}/evidence", authMiddleware(http.HandlerFunc(serveCampaignFundEvidence)))
+	mux.Handle("POST /donations", authMiddleware(http.HandlerFunc(createMidtransDonation)))
+	mux.Handle("GET /donations/mine", authMiddleware(http.HandlerFunc(listDonorDonationProgress)))
+	mux.Handle("GET /donations/pending", authMiddleware(http.HandlerFunc(listPendingCampaignDonations)))
+	mux.Handle("POST /donations/{reference}/cancel", authMiddleware(http.HandlerFunc(cancelMidtransDonation)))
+	mux.Handle("GET /donations/{reference}/status", authMiddleware(http.HandlerFunc(getMidtransDonationStatus)))
+	mux.Handle("POST /donations/simulate", authMiddleware(http.HandlerFunc(simulateDonation)))
+	mux.HandleFunc("POST /webhook/midtrans", midtransPaymentWebhook)
+	mux.Handle("GET /campaigns/{campaignID}/media/{mediaID}", authMiddleware(http.HandlerFunc(serveCampaignMedia)))
 	mux.Handle("POST /graphql", authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Query         string                 `json:"query"`
@@ -223,6 +244,49 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func buildSchema() graphql.Schema {
+	campaignMediaType := graphql.NewObject(graphql.ObjectConfig{Name: "CampaignMedia", Fields: graphql.Fields{
+		"id":          &graphql.Field{Type: graphql.ID},
+		"mediaType":   &graphql.Field{Type: graphql.String},
+		"contentType": &graphql.Field{Type: graphql.String},
+	}})
+	questionType := graphql.NewObject(graphql.ObjectConfig{Name: "CampaignQuestion", Fields: graphql.Fields{
+		"id":       &graphql.Field{Type: graphql.Int, Resolve: func(p graphql.ResolveParams) (interface{}, error) { return p.Source.(CampaignQuestion).ID, nil }},
+		"question": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) { return p.Source.(CampaignQuestion).Question, nil }},
+		"askedByName": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			return p.Source.(CampaignQuestion).AskedByName, nil
+		}},
+		"createdAt": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) { return p.Source.(CampaignQuestion).CreatedAt, nil }},
+		"answer":    &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) { return p.Source.(CampaignQuestion).Answer, nil }},
+		"answeredByName": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			return p.Source.(CampaignQuestion).AnsweredByName, nil
+		}},
+		"answeredAt": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) { return p.Source.(CampaignQuestion).AnsweredAt, nil }},
+	}})
+	fundUpdateType := graphql.NewObject(graphql.ObjectConfig{Name: "CampaignFundUpdate", Fields: graphql.Fields{
+		"id":      &graphql.Field{Type: graphql.Int, Resolve: func(p graphql.ResolveParams) (interface{}, error) { return p.Source.(CampaignFundUpdate).ID, nil }},
+		"amount":  &graphql.Field{Type: graphql.Int, Resolve: func(p graphql.ResolveParams) (interface{}, error) { return p.Source.(CampaignFundUpdate).Amount, nil }},
+		"purpose": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) { return p.Source.(CampaignFundUpdate).Purpose, nil }},
+		"description": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			return p.Source.(CampaignFundUpdate).Description, nil
+		}},
+		"createdByName": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			return p.Source.(CampaignFundUpdate).CreatedByName, nil
+		}},
+		"createdAt": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			return p.Source.(CampaignFundUpdate).CreatedAt, nil
+		}},
+		"hasEvidence": &graphql.Field{Type: graphql.Boolean, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			return p.Source.(CampaignFundUpdate).HasEvidence, nil
+		}},
+		"evidenceContentType": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			return p.Source.(CampaignFundUpdate).EvidenceContentType, nil
+		}},
+	}})
+	donorType := graphql.NewObject(graphql.ObjectConfig{Name: "CampaignDonor", Fields: graphql.Fields{
+		"name":      &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) { return p.Source.(CampaignDonor).Name, nil }},
+		"amount":    &graphql.Field{Type: graphql.Int, Resolve: func(p graphql.ResolveParams) (interface{}, error) { return p.Source.(CampaignDonor).Amount, nil }},
+		"createdAt": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) { return p.Source.(CampaignDonor).CreatedAt, nil }},
+	}})
 	campaignType := graphql.NewObject(graphql.ObjectConfig{Name: "Campaign", Fields: graphql.Fields{
 		"id":          &graphql.Field{Type: graphql.Int},
 		"title":       &graphql.Field{Type: graphql.String},
@@ -230,11 +294,107 @@ func buildSchema() graphql.Schema {
 		"target":      &graphql.Field{Type: graphql.Int},
 		"collected":   &graphql.Field{Type: graphql.Int},
 		"status":      &graphql.Field{Type: graphql.String},
+		"submittedByName": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			campaign, ok := p.Source.(Campaign)
+			if !ok {
+				return "", nil
+			}
+			return campaign.SubmittedByName, nil
+		}},
+		"submittedByEmail": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			campaign, ok := p.Source.(Campaign)
+			if !ok {
+				return "", nil
+			}
+			return campaign.SubmittedByEmail, nil
+		}},
+		"createdAt": &graphql.Field{Type: graphql.String, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			campaign, ok := p.Source.(Campaign)
+			if !ok {
+				return "", nil
+			}
+			return campaign.CreatedAt, nil
+		}},
+		"media": &graphql.Field{Type: graphql.NewList(campaignMediaType), Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			campaign, ok := p.Source.(Campaign)
+			if !ok {
+				return nil, nil
+			}
+			if campaign.Media != nil {
+				return campaign.Media, nil
+			}
+			rows, err := db.Query(p.Context, "SELECT id,media_type,content_type FROM campaign_media WHERE campaign_id=$1 ORDER BY id", campaign.ID)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			media := []CampaignMedia{}
+			for rows.Next() {
+				var item CampaignMedia
+				var id int64
+				if err = rows.Scan(&id, &item.MediaType, &item.ContentType); err != nil {
+					return nil, err
+				}
+				item.ID = strconv.FormatInt(id, 10)
+				media = append(media, item)
+			}
+			return media, rows.Err()
+		}},
+		"canManage": &graphql.Field{Type: graphql.Boolean, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			campaign, ok := p.Source.(Campaign)
+			if !ok {
+				return false, nil
+			}
+			user, authenticated := currentUser(p)
+			if !authenticated {
+				return false, nil
+			}
+			return campaignCanBeManaged(p.Context, campaign.ID, user)
+		}},
+		"canAnswerQuestions": &graphql.Field{Type: graphql.Boolean, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			campaign, ok := p.Source.(Campaign)
+			if !ok {
+				return false, nil
+			}
+			user, authenticated := currentUser(p)
+			if !authenticated {
+				return false, nil
+			}
+			return campaignCanBeAnswered(p.Context, campaign.ID, user)
+		}},
+		"questions": &graphql.Field{Type: graphql.NewList(questionType), Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			campaign, ok := p.Source.(Campaign)
+			if !ok {
+				return nil, nil
+			}
+			return listCampaignQuestions(p.Context, campaign.ID)
+		}},
+		"fundUpdates": &graphql.Field{Type: graphql.NewList(fundUpdateType), Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			campaign, ok := p.Source.(Campaign)
+			if !ok {
+				return nil, nil
+			}
+			return listCampaignFundUpdates(p.Context, campaign.ID)
+		}},
+		"donors": &graphql.Field{Type: graphql.NewList(donorType), Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			campaign, ok := p.Source.(Campaign)
+			if !ok {
+				return nil, nil
+			}
+			return listCampaignDonors(p.Context, campaign.ID)
+		}},
+		"donorCount": &graphql.Field{Type: graphql.Int, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			campaign, ok := p.Source.(Campaign)
+			if !ok {
+				return 0, nil
+			}
+			return countCampaignDonors(p.Context, campaign.ID)
+		}},
 	}})
 
 	query := graphql.NewObject(graphql.ObjectConfig{Name: "Query", Fields: graphql.Fields{
 		"campaigns": &graphql.Field{Type: graphql.NewList(campaignType), Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-			rows, err := db.Query(p.Context, "SELECT id,title,description,target,collected,status FROM campaigns WHERE status='AKTIF' ORDER BY id DESC")
+			rows, err := db.Query(p.Context, "SELECT id,title,description,target,collected,status FROM campaigns WHERE status IN ('AKTIF','SELESAI') ORDER BY id DESC")
 			if err != nil {
 				return nil, err
 			}
@@ -247,13 +407,16 @@ func buildSchema() graphql.Schema {
 				}
 				out = append(out, c)
 			}
-			return out, rows.Err()
+			if err := rows.Err(); err != nil {
+				return nil, err
+			}
+			return loadCampaignMedia(p.Context, out)
 		}},
 		"campaign": &graphql.Field{Type: campaignType, Args: graphql.FieldConfigArgument{
 			"id": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Int)},
 		}, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
 			var c Campaign
-			err := db.QueryRow(p.Context, "SELECT id,title,description,target,collected,status FROM campaigns WHERE id=$1 AND status='AKTIF'", p.Args["id"]).Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status)
+			err := db.QueryRow(p.Context, "SELECT id,title,description,target,collected,status FROM campaigns WHERE id=$1 AND status IN ('AKTIF','SELESAI')", p.Args["id"]).Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, nil
 			}
@@ -263,7 +426,12 @@ func buildSchema() graphql.Schema {
 			if _, err := requireRole(p, "ADMIN"); err != nil {
 				return nil, err
 			}
-			rows, err := db.Query(p.Context, "SELECT id,title,description,target,collected,status FROM campaigns WHERE status='MENUNGGU' ORDER BY id")
+			rows, err := db.Query(p.Context, `
+				SELECT c.id,c.title,c.description,c.target,c.collected,c.status,
+					COALESCE(u.name,''),COALESCE(u.email,''),c.created_at::text
+				FROM campaigns c LEFT JOIN users u ON u.id=c.owner_id
+				WHERE c.status='MENUNGGU' ORDER BY c.created_at,c.id
+			`)
 			if err != nil {
 				return nil, err
 			}
@@ -271,12 +439,33 @@ func buildSchema() graphql.Schema {
 			out := []Campaign{}
 			for rows.Next() {
 				var c Campaign
-				if err := rows.Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status); err != nil {
+				if err := rows.Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status, &c.SubmittedByName, &c.SubmittedByEmail, &c.CreatedAt); err != nil {
 					return nil, err
 				}
 				out = append(out, c)
 			}
-			return out, rows.Err()
+			if err := rows.Err(); err != nil {
+				return nil, err
+			}
+			return loadCampaignMedia(p.Context, out)
+		}},
+		"pendingCampaign": &graphql.Field{Type: campaignType, Args: graphql.FieldConfigArgument{
+			"id": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Int)},
+		}, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			if _, err := requireRole(p, "ADMIN"); err != nil {
+				return nil, err
+			}
+			var c Campaign
+			err := db.QueryRow(p.Context, `
+				SELECT c.id,c.title,c.description,c.target,c.collected,c.status,
+					COALESCE(u.name,''),COALESCE(u.email,''),c.created_at::text
+				FROM campaigns c LEFT JOIN users u ON u.id=c.owner_id
+				WHERE c.id=$1 AND c.status='MENUNGGU'
+			`, p.Args["id"]).Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status, &c.SubmittedByName, &c.SubmittedByEmail, &c.CreatedAt)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, nil
+			}
+			return c, err
 		}},
 	}})
 
@@ -345,6 +534,82 @@ func buildSchema() graphql.Schema {
 			}
 			return c, nil
 		}},
+		"askCampaignQuestion": &graphql.Field{Type: questionType, Args: graphql.FieldConfigArgument{
+			"campaignID": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Int)},
+			"question":   &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
+		}, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			user, err := requireRole(p, "DONATUR")
+			if err != nil {
+				return nil, err
+			}
+			campaignID := int64(p.Args["campaignID"].(int))
+			questionText := strings.TrimSpace(p.Args["question"].(string))
+			if utf8.RuneCountInString(questionText) < 10 || utf8.RuneCountInString(questionText) > 2000 {
+				return nil, errors.New("pertanyaan harus berisi 10 sampai 2000 karakter")
+			}
+			var question CampaignQuestion
+			question.AskedByName = user.Name
+			err = db.QueryRow(p.Context, `
+				INSERT INTO campaign_questions(campaign_id,user_id,question)
+				SELECT id,$2,$3 FROM campaigns WHERE id=$1 AND status='AKTIF'
+				RETURNING id,question,created_at::text
+			`, campaignID, user.ID, questionText).Scan(&question.ID, &question.Question, &question.CreatedAt)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, errors.New("campaign tidak ditemukan atau tidak aktif")
+			}
+			return question, err
+		}},
+		"answerCampaignQuestion": &graphql.Field{Type: questionType, Args: graphql.FieldConfigArgument{
+			"questionID": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Int)},
+			"answer":     &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
+		}, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+			user, ok := currentUser(p)
+			if !ok {
+				return nil, errors.New("autentikasi diperlukan")
+			}
+			questionID := int64(p.Args["questionID"].(int))
+			answer := strings.TrimSpace(p.Args["answer"].(string))
+			if utf8.RuneCountInString(answer) < 2 || utf8.RuneCountInString(answer) > 2000 {
+				return nil, errors.New("jawaban harus berisi 2 sampai 2000 karakter")
+			}
+			var campaignID int64
+			err := db.QueryRow(p.Context, `
+				SELECT q.campaign_id FROM campaign_questions q
+				JOIN campaigns c ON c.id=q.campaign_id
+				WHERE q.id=$1 AND c.status='AKTIF'
+			`, questionID).Scan(&campaignID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, errors.New("pertanyaan tidak ditemukan atau campaign tidak aktif")
+			}
+			if err != nil {
+				return nil, err
+			}
+			canAnswer, err := campaignCanBeAnswered(p.Context, campaignID, user)
+			if err != nil {
+				return nil, err
+			}
+			if !canAnswer {
+				return nil, errors.New("hanya pemilik campaign atau Admin yang dapat menjawab")
+			}
+			var question CampaignQuestion
+			question.AnsweredByName = user.Name
+			err = db.QueryRow(p.Context, `
+				UPDATE campaign_questions
+				SET answer=$2,answered_by=$3,answered_at=NOW()
+				WHERE id=$1 AND answer IS NULL
+				RETURNING id,question,created_at::text,answer,answered_at::text
+			`, questionID, answer, user.ID).Scan(
+				&question.ID,
+				&question.Question,
+				&question.CreatedAt,
+				&question.Answer,
+				&question.AnsweredAt,
+			)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, errors.New("pertanyaan ini sudah dijawab")
+			}
+			return question, err
+		}},
 	}})
 
 	schema, err := graphql.NewSchema(graphql.SchemaConfig{Query: query, Mutation: mutation})
@@ -354,184 +619,44 @@ func buildSchema() graphql.Schema {
 	return schema
 }
 
-func currentUser(p graphql.ResolveParams) (User, bool) {
-	u, ok := p.Context.Value(userKey).(User)
-	return u, ok
-}
+func loadCampaignMedia(ctx context.Context, campaigns []Campaign) ([]Campaign, error) {
+	if len(campaigns) == 0 {
+		return campaigns, nil
+	}
 
-func requireRole(p graphql.ResolveParams, roles ...string) (User, error) {
-	u, ok := currentUser(p)
-	if !ok {
-		return User{}, errors.New("autentikasi diperlukan")
+	indexByID := make(map[int64]int, len(campaigns))
+	ids := make([]int64, len(campaigns))
+	for index := range campaigns {
+		campaigns[index].Media = []CampaignMedia{}
+		indexByID[campaigns[index].ID] = index
+		ids[index] = campaigns[index].ID
 	}
-	for _, role := range roles {
-		if u.Role == role {
-			return u, nil
-		}
-	}
-	return User{}, errors.New("akses ditolak: role tidak memiliki izin")
-}
-<<<<<<< HEAD
-func main() {
-	if len(jwtSecret) < 32 {
-		log.Fatal("JWT_SECRET wajib minimal 32 karakter")
-	}
-	var err error
-	db, err = pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
+
+	rows, err := db.Query(ctx, `
+		SELECT campaign_id,id,media_type,content_type
+		FROM campaign_media
+		WHERE campaign_id = ANY($1)
+		ORDER BY campaign_id,id
+	`, ids)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	defer db.Close()
-	if err = db.Ping(context.Background()); err != nil {
-		log.Fatal(err)
-	}
-	schema := buildSchema()
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "campaign"})
-	})
-	mux.HandleFunc("POST /auth/register", register)
-	mux.HandleFunc("POST /auth/login", login)
-	mux.Handle("POST /campaigns", authMiddleware(http.HandlerFunc(createCampaignWithMedia)))
-	mux.Handle("POST /donations/simulate", authMiddleware(http.HandlerFunc(simulateDonation)))
-	mux.Handle("GET /campaigns/{campaignID}/media/{mediaID}", authMiddleware(http.HandlerFunc(serveCampaignMedia)))
-	mux.Handle("/graphql", authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Query     string                 `json:"query"`
-			Variables map[string]interface{} `json:"variables"`
+	defer rows.Close()
+	for rows.Next() {
+		var campaignID, mediaID int64
+		var media CampaignMedia
+		if err := rows.Scan(&campaignID, &mediaID, &media.MediaType, &media.ContentType); err != nil {
+			return nil, err
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-			http.Error(w, "request tidak valid", 400)
-			return
+		if index, exists := indexByID[campaignID]; exists {
+			media.ID = strconv.FormatInt(mediaID, 10)
+			campaigns[index].Media = append(campaigns[index].Media, media)
 		}
-		if strings.Count(req.Query, "{") > 12 {
-			http.Error(w, "query terlalu kompleks", 400)
-			return
-		}
-		result := graphql.Do(graphql.Params{Schema: schema, RequestString: req.Query, VariableValues: req.Variables, Context: r.Context()})
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(result)
-	})))
-	mux.HandleFunc("POST /webhook/payment", paymentWebhook)
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8001"
 	}
-	log.Printf("Campaign Service listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, securityHeaders(mux)))
-}
-func buildSchema() graphql.Schema {
-	campaignMediaType := graphql.NewObject(graphql.ObjectConfig{Name: "CampaignMedia", Fields: graphql.Fields{
-		"id":          &graphql.Field{Type: graphql.ID},
-		"mediaType":   &graphql.Field{Type: graphql.String},
-		"contentType": &graphql.Field{Type: graphql.String},
-	}})
-	campaignType := graphql.NewObject(graphql.ObjectConfig{Name: "Campaign", Fields: graphql.Fields{
-		"id": &graphql.Field{Type: graphql.Int}, "title": &graphql.Field{Type: graphql.String}, "description": &graphql.Field{Type: graphql.String}, "target": &graphql.Field{Type: graphql.Int}, "collected": &graphql.Field{Type: graphql.Int}, "status": &graphql.Field{Type: graphql.String},
-		"media": &graphql.Field{Type: graphql.NewList(campaignMediaType), Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-			campaign, ok := p.Source.(Campaign)
-			if !ok {
-				return nil, nil
-			}
-			rows, err := db.Query(p.Context, "SELECT id,media_type,content_type FROM campaign_media WHERE campaign_id=$1 ORDER BY id", campaign.ID)
-			if err != nil {
-				return nil, err
-			}
-			defer rows.Close()
-			media := []CampaignMedia{}
-			for rows.Next() {
-				var item CampaignMedia
-				var id int64
-				if err = rows.Scan(&id, &item.MediaType, &item.ContentType); err != nil {
-					return nil, err
-				}
-				item.ID = strconv.FormatInt(id, 10)
-				media = append(media, item)
-			}
-			return media, rows.Err()
-		}},
-	}})
-	query := graphql.NewObject(graphql.ObjectConfig{Name: "Query", Fields: graphql.Fields{
-		"campaigns": &graphql.Field{Type: graphql.NewList(campaignType), Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-			rows, e := db.Query(p.Context, "SELECT id,title,description,target,collected,status FROM campaigns WHERE status='AKTIF' ORDER BY id DESC")
-			if e != nil {
-				return nil, e
-			}
-			defer rows.Close()
-			out := []Campaign{}
-			for rows.Next() {
-				var c Campaign
-				if e = rows.Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status); e != nil {
-					return nil, e
-				}
-				out = append(out, c)
-			}
-			return out, rows.Err()
-		}},
-		"campaign": &graphql.Field{Type: campaignType, Args: graphql.FieldConfigArgument{"id": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Int)}}, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-			var c Campaign
-			e := db.QueryRow(p.Context, "SELECT id,title,description,target,collected,status FROM campaigns WHERE id=$1 AND status='AKTIF'", p.Args["id"]).Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status)
-			if e == sql.ErrNoRows {
-				return nil, nil
-			}
-			return c, e
-		}},
-		"pendingCampaigns": &graphql.Field{Type: graphql.NewList(campaignType), Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-			if _, e := requireRole(p, "ADMIN"); e != nil {
-				return nil, e
-			}
-			rows, e := db.Query(p.Context, "SELECT id,title,description,target,collected,status FROM campaigns WHERE status='MENUNGGU' ORDER BY id")
-			if e != nil {
-				return nil, e
-			}
-			defer rows.Close()
-			out := []Campaign{}
-			for rows.Next() {
-				var c Campaign
-				if e = rows.Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status); e != nil {
-					return nil, e
-				}
-				out = append(out, c)
-			}
-			return out, rows.Err()
-		}},
-	}})
-	mutation := graphql.NewObject(graphql.ObjectConfig{Name: "Mutation", Fields: graphql.Fields{
-		"createCampaign": &graphql.Field{Type: campaignType, Args: graphql.FieldConfigArgument{"title": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)}, "description": &graphql.ArgumentConfig{Type: graphql.String}, "target": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Int)}}, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-			u, ok := currentUser(p)
-			if !ok {
-				return nil, errors.New("autentikasi diperlukan")
-			}
-			title := strings.TrimSpace(p.Args["title"].(string))
-			target := p.Args["target"].(int)
-			if len(title) < 3 || len(title) > 100 || target <= 0 {
-				return nil, errors.New("judul atau target tidak valid")
-			}
-			desc, _ := p.Args["description"].(string)
-			var c Campaign
-			e := db.QueryRow(p.Context, "INSERT INTO campaigns(title,description,target,status,owner_id) VALUES($1,$2,$3,'MENUNGGU',$4) RETURNING id,title,description,target,collected,status", title, desc, target, u.ID).Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status)
-			if e == nil {
-				notifyEvent(map[string]interface{}{"event": "CAMPAIGN_CREATED", "campaign": c})
-			}
-			return c, e
-		}},
-		"approveCampaign": &graphql.Field{Type: campaignType, Args: graphql.FieldConfigArgument{"id": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Int)}}, Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-			if _, e := requireRole(p, "ADMIN"); e != nil {
-				return nil, e
-			}
-			var c Campaign
-			e := db.QueryRow(p.Context, "UPDATE campaigns SET status='AKTIF' WHERE id=$1 AND status='MENUNGGU' RETURNING id,title,description,target,collected,status", p.Args["id"]).Scan(&c.ID, &c.Title, &c.Description, &c.Target, &c.Collected, &c.Status)
-			if e == nil {
-				notifyEvent(map[string]interface{}{"event": "CAMPAIGN_APPROVED", "campaign": c})
-			}
-			return c, e
-		}},
-	}})
-	s, e := graphql.NewSchema(graphql.SchemaConfig{Query: query, Mutation: mutation})
-	if e != nil {
-		log.Fatal(e)
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
-	return s
+	return campaigns, nil
 }
 
 const (
@@ -643,15 +768,149 @@ func createCampaignWithMedia(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if err := addOutboxEvent(r.Context(), tx, "campaign.created", map[string]interface{}{
+		"event":    "CAMPAIGN_CREATED",
+		"campaign": campaign,
+	}); err != nil {
+		http.Error(w, "gagal membuat event campaign", http.StatusInternalServerError)
+		return
+	}
 	if err = tx.Commit(r.Context()); err != nil {
 		http.Error(w, "gagal menyelesaikan penyimpanan campaign", http.StatusInternalServerError)
 		return
 	}
 
-	notifyEvent(map[string]interface{}{"event": "CAMPAIGN_CREATED", "campaign": campaign})
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(campaign)
+	if err := json.NewEncoder(w).Encode(campaign); err != nil {
+		log.Printf("gagal menulis response campaign: %v", err)
+	}
+}
+
+func uploadCampaignMedia(w http.ResponseWriter, r *http.Request) {
+	u, ok := r.Context().Value(userKey).(User)
+	if !ok {
+		http.Error(w, "autentikasi diperlukan", http.StatusUnauthorized)
+		return
+	}
+
+	campaignID, err := strconv.ParseInt(r.PathValue("campaignID"), 10, 64)
+	if err != nil || campaignID <= 0 {
+		http.NotFound(w, r)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxCampaignRequestSize)
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "total upload maksimal 50 MB", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "form upload tidak valid", http.StatusBadRequest)
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+
+	photoHeaders := r.MultipartForm.File["photos"]
+	videoHeaders := r.MultipartForm.File["video"]
+	if len(photoHeaders) == 0 {
+		http.Error(w, "minimal 1 foto campaign wajib diunggah", http.StatusBadRequest)
+		return
+	}
+	if len(photoHeaders) > maxCampaignPhotos {
+		http.Error(w, "maksimal 5 foto dapat diunggah", http.StatusBadRequest)
+		return
+	}
+	if len(videoHeaders) > 1 {
+		http.Error(w, "maksimal 1 video dapat diunggah", http.StatusBadRequest)
+		return
+	}
+
+	media := make([]uploadedCampaignMedia, 0, len(photoHeaders)+len(videoHeaders))
+	for _, fileHeader := range photoHeaders {
+		item, err := readCampaignMedia(fileHeader, "IMAGE", maxCampaignPhotoSize)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if item.contentType != "image/jpeg" && item.contentType != "image/png" && item.contentType != "image/webp" {
+			http.Error(w, "format foto harus JPG, PNG, atau WebP", http.StatusBadRequest)
+			return
+		}
+		media = append(media, item)
+	}
+	for _, fileHeader := range videoHeaders {
+		item, err := readCampaignMedia(fileHeader, "VIDEO", maxCampaignVideoSize)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if item.contentType != "video/mp4" {
+			http.Error(w, "format video harus MP4", http.StatusBadRequest)
+			return
+		}
+		media = append(media, item)
+	}
+
+	tx, err := db.Begin(r.Context())
+	if err != nil {
+		http.Error(w, "gagal memulai penyimpanan media campaign", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	var ownerID sql.NullInt64
+	var status string
+	err = tx.QueryRow(r.Context(), "SELECT owner_id,status FROM campaigns WHERE id=$1 FOR UPDATE", campaignID).Scan(&ownerID, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "gagal memeriksa campaign", http.StatusInternalServerError)
+		return
+	}
+	if u.Role != "ADMIN" && (!ownerID.Valid || ownerID.Int64 != u.ID) {
+		http.Error(w, "akses ditolak", http.StatusForbidden)
+		return
+	}
+	if status != "MENUNGGU" {
+		http.Error(w, "media hanya dapat ditambahkan sebelum campaign disetujui", http.StatusConflict)
+		return
+	}
+
+	var existingPhotos, existingVideos int64
+	err = tx.QueryRow(r.Context(),
+		"SELECT COUNT(*) FILTER (WHERE media_type='IMAGE'), COUNT(*) FILTER (WHERE media_type='VIDEO') FROM campaign_media WHERE campaign_id=$1",
+		campaignID,
+	).Scan(&existingPhotos, &existingVideos)
+	if err != nil {
+		http.Error(w, "gagal memeriksa media campaign", http.StatusInternalServerError)
+		return
+	}
+	if existingPhotos+int64(len(photoHeaders)) > maxCampaignPhotos || existingVideos+int64(len(videoHeaders)) > 1 {
+		http.Error(w, "campaign dapat memiliki maksimal 5 foto dan 1 video", http.StatusConflict)
+		return
+	}
+
+	for _, item := range media {
+		if _, err := tx.Exec(r.Context(),
+			"INSERT INTO campaign_media(campaign_id,media_type,content_type,file_data) VALUES($1,$2,$3,$4)",
+			campaignID, item.mediaType, item.contentType, item.data,
+		); err != nil {
+			http.Error(w, "gagal menyimpan media campaign", http.StatusInternalServerError)
+			return
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		http.Error(w, "gagal menyelesaikan penyimpanan media campaign", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]int{"uploaded": len(media)})
 }
 
 func readCampaignMedia(fileHeader *multipart.FileHeader, mediaType string, maxSize int64) (uploadedCampaignMedia, error) {
@@ -723,12 +982,12 @@ func serveCampaignMedia(w http.ResponseWriter, r *http.Request) {
 	}
 
 	u, authenticated := r.Context().Value(userKey).(User)
-	if status != "AKTIF" && (!authenticated || (u.Role != "ADMIN" && (!ownerID.Valid || u.ID != ownerID.Int64))) {
+	if status != "AKTIF" && status != "SELESAI" && (!authenticated || (u.Role != "ADMIN" && (!ownerID.Valid || u.ID != ownerID.Int64))) {
 		http.NotFound(w, r)
 		return
 	}
 
-	if status == "AKTIF" {
+	if status == "AKTIF" || status == "SELESAI" {
 		w.Header().Set("Cache-Control", "public, max-age=300")
 	} else {
 		w.Header().Set("Cache-Control", "private, no-store")
@@ -738,8 +997,24 @@ func serveCampaignMedia(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "inline")
 	w.Write(data)
 }
-=======
->>>>>>> 968f0cd15ad87da8ddedc6237390d4e90e17b000
+
+func currentUser(p graphql.ResolveParams) (User, bool) {
+	u, ok := p.Context.Value(userKey).(User)
+	return u, ok
+}
+
+func requireRole(p graphql.ResolveParams, roles ...string) (User, error) {
+	u, ok := currentUser(p)
+	if !ok {
+		return User{}, errors.New("autentikasi diperlukan")
+	}
+	for _, role := range roles {
+		if u.Role == role {
+			return u, nil
+		}
+	}
+	return User{}, errors.New("akses ditolak: role tidak memiliki izin")
+}
 
 func register(w http.ResponseWriter, r *http.Request) {
 	var in struct {
@@ -1014,7 +1289,12 @@ func paymentWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if payload.Status == "SETTLEMENT" {
-		result, updateErr := tx.Exec(r.Context(), "UPDATE campaigns SET collected=collected+$1 WHERE id=$2", payload.Amount, payload.CampaignID)
+		result, updateErr := tx.Exec(r.Context(), `
+			UPDATE campaigns
+			SET collected=collected+$1,
+				status=CASE WHEN collected+$1 >= target THEN 'SELESAI' ELSE status END
+			WHERE id=$2
+		`, payload.Amount, payload.CampaignID)
 		if updateErr != nil {
 			http.Error(w, "gagal memperbarui campaign", http.StatusInternalServerError)
 			return
@@ -1040,7 +1320,32 @@ func paymentWebhook(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted", "message": "event akan diproses secara asinkron"})
 }
 
-<<<<<<< HEAD
+func serverTLSConfig() (*tls.Config, error) {
+	caPath := strings.TrimSpace(os.Getenv("TLS_CA_FILE"))
+	certPath := strings.TrimSpace(os.Getenv("TLS_CERT_FILE"))
+	keyPath := strings.TrimSpace(os.Getenv("TLS_KEY_FILE"))
+	if caPath == "" || certPath == "" || keyPath == "" {
+		return nil, errors.New("TLS_CA_FILE, TLS_CERT_FILE, dan TLS_KEY_FILE wajib diisi saat MTLS_ENABLED=true")
+	}
+	caPEM, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, err
+	}
+	clientCAs := x509.NewCertPool()
+	if !clientCAs.AppendCertsFromPEM(caPEM) {
+		return nil, errors.New("TLS_CA_FILE tidak berisi CA certificate yang valid")
+	}
+	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ClientCAs:  clientCAs,
+		// Middleware memaksa sertifikat terverifikasi pada semua endpoint selain /health.
+		ClientAuth: tls.VerifyClientCertIfGiven,
+	}, nil
+}
+
 func simulateDonation(w http.ResponseWriter, r *http.Request) {
 	u, ok := r.Context().Value(userKey).(User)
 	if !ok {
@@ -1101,17 +1406,30 @@ func simulateDonation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err = tx.Exec(r.Context(),
-		"INSERT INTO donations(campaign_id,donor_name,donor_email,donor_phone,amount,payment_reference,status) VALUES($1,$2,$3,$4,$5,$6,'SETTLEMENT')",
-		campaignID, in.DonorName, in.DonorEmail, in.DonorPhone, in.Amount, reference,
+		"INSERT INTO donations(campaign_id,donor_user_id,donor_name,donor_email,donor_phone,amount,payment_reference,status) VALUES($1,$2,$3,$4,$5,$6,$7,'SETTLEMENT')",
+		campaignID, u.ID, in.DonorName, in.DonorEmail, in.DonorPhone, in.Amount, reference,
 	); err != nil {
 		http.Error(w, "gagal menyimpan donasi simulasi", http.StatusInternalServerError)
 		return
 	}
-	if _, err = tx.Exec(r.Context(),
-		"UPDATE campaigns SET collected=collected+$1 WHERE id=$2",
+	if _, err = tx.Exec(r.Context(), `
+		UPDATE campaigns
+		SET collected=collected+$1,
+			status=CASE WHEN collected+$1 >= target THEN 'SELESAI' ELSE status END
+		WHERE id=$2
+	`,
 		in.Amount, campaignID,
 	); err != nil {
 		http.Error(w, "gagal memperbarui progres campaign", http.StatusInternalServerError)
+		return
+	}
+	if err := addOutboxEvent(r.Context(), tx, "donation.created", map[string]interface{}{
+		"event":       "SIMULATED_DONATION",
+		"campaign_id": campaignID,
+		"donor_name":  "Donatur",
+		"amount":      in.Amount,
+	}); err != nil {
+		http.Error(w, "gagal membuat event donasi", http.StatusInternalServerError)
 		return
 	}
 	if err = tx.Commit(r.Context()); err != nil {
@@ -1119,14 +1437,7 @@ func simulateDonation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	notifyEvent(map[string]interface{}{
-		"event":       "SIMULATED_DONATION",
-		"campaign_id": campaignID,
-		"donor_name":  "Donatur",
-		"amount":      in.Amount,
-	})
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "simulated", "reference": reference})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "simulated", "reference": reference})
 }
 
 func validDonorEmail(email string) bool {
@@ -1153,32 +1464,6 @@ func validDonorPhone(phone string) bool {
 		}
 	}
 	return digits >= 8 && digits <= 15
-=======
-func serverTLSConfig() (*tls.Config, error) {
-	caPath := strings.TrimSpace(os.Getenv("TLS_CA_FILE"))
-	certPath := strings.TrimSpace(os.Getenv("TLS_CERT_FILE"))
-	keyPath := strings.TrimSpace(os.Getenv("TLS_KEY_FILE"))
-	if caPath == "" || certPath == "" || keyPath == "" {
-		return nil, errors.New("TLS_CA_FILE, TLS_CERT_FILE, dan TLS_KEY_FILE wajib diisi saat MTLS_ENABLED=true")
-	}
-	caPEM, err := os.ReadFile(caPath)
-	if err != nil {
-		return nil, err
-	}
-	clientCAs := x509.NewCertPool()
-	if !clientCAs.AppendCertsFromPEM(caPEM) {
-		return nil, errors.New("TLS_CA_FILE tidak berisi CA certificate yang valid")
-	}
-	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
-		return nil, err
-	}
-	return &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		ClientCAs:  clientCAs,
-		// Middleware memaksa sertifikat terverifikasi pada semua endpoint selain /health.
-		ClientAuth: tls.VerifyClientCertIfGiven,
-	}, nil
->>>>>>> 968f0cd15ad87da8ddedc6237390d4e90e17b000
 }
 
 func securityHeaders(next http.Handler) http.Handler {

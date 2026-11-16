@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS campaigns (
 CREATE TABLE IF NOT EXISTS donations (
   id BIGSERIAL PRIMARY KEY,
   campaign_id BIGINT NOT NULL REFERENCES campaigns(id),
+  donor_user_id BIGINT REFERENCES users(id),
+  payment_url TEXT,
   donor_name VARCHAR(100) NOT NULL,
   donor_email VARCHAR(150),
   donor_phone VARCHAR(30),
@@ -29,6 +31,10 @@ CREATE TABLE IF NOT EXISTS donations (
   status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING','SETTLEMENT','FAILED')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE donations ADD COLUMN IF NOT EXISTS donor_user_id BIGINT REFERENCES users(id);
+ALTER TABLE donations ADD COLUMN IF NOT EXISTS donor_email VARCHAR(150);
+ALTER TABLE donations ADD COLUMN IF NOT EXISTS donor_phone VARCHAR(30);
+ALTER TABLE donations ADD COLUMN IF NOT EXISTS payment_url TEXT;
 CREATE TABLE IF NOT EXISTS campaign_media (
   id BIGSERIAL PRIMARY KEY,
   campaign_id BIGINT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,

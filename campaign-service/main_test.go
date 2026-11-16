@@ -3,12 +3,132 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha512"
+	"database/sql"
+	"encoding/hex"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+func TestMapMidtransStatus(t *testing.T) {
+	tests := []struct {
+		name        string
+		transaction string
+		fraud       string
+		want        string
+	}{
+		{name: "settlement", transaction: "settlement", want: "SETTLEMENT"},
+		{name: "accepted capture", transaction: "capture", fraud: "accept", want: "SETTLEMENT"},
+		{name: "challenge capture stays pending", transaction: "capture", fraud: "challenge", want: "PENDING"},
+		{name: "pending", transaction: "pending", want: "PENDING"},
+		{name: "expired", transaction: "expire", want: "FAILED"},
+		{name: "cancelled", transaction: "cancel", want: "FAILED"},
+		{name: "denied", transaction: "deny", want: "FAILED"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := mapMidtransStatus(test.transaction, test.fraud); got != test.want {
+				t.Fatalf("mapMidtransStatus() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestMidtransAmountMatches(t *testing.T) {
+	tests := []struct {
+		amount string
+		want   bool
+	}{
+		{amount: "25000.00", want: true},
+		{amount: "25000.01", want: false},
+		{amount: "NaN", want: false},
+		{amount: "invalid", want: false},
+	}
+	for _, test := range tests {
+		if got := midtransAmountMatches(test.amount, 25000); got != test.want {
+			t.Errorf("midtransAmountMatches(%q) = %v, want %v", test.amount, got, test.want)
+		}
+	}
+}
+
+func TestAvailableDonationAmount(t *testing.T) {
+	tests := []struct {
+		name      string
+		target    int64
+		collected int64
+		pending   int64
+		want      int64
+	}{
+		{name: "remaining target", target: 500000, collected: 300000, want: 200000},
+		{name: "subtract pending donations", target: 500000, collected: 300000, pending: 100000, want: 100000},
+		{name: "target already met", target: 500000, collected: 500000, want: 0},
+		{name: "pending donations exceed remaining target", target: 500000, collected: 300000, pending: 250000, want: 0},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := availableDonationAmount(test.target, test.collected, test.pending); got != test.want {
+				t.Fatalf("availableDonationAmount() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestFormatRupiah(t *testing.T) {
+	if got := formatRupiah(85000); got != "85.000" {
+		t.Fatalf("formatRupiah() = %q, want %q", got, "85.000")
+	}
+}
+
+func TestMidtransNotificationSignature(t *testing.T) {
+	sum := sha512.Sum512([]byte("ORDER12320010000.00server-key"))
+	want := hex.EncodeToString(sum[:])
+	if got := midtransNotificationSignature("ORDER123", "200", "10000.00", "server-key"); got != want {
+		t.Fatalf("midtransNotificationSignature() = %q, want %q", got, want)
+	}
+}
+
+func TestValidMidtransRedirectURL(t *testing.T) {
+	if !validMidtransRedirectURL("https://app.sandbox.midtrans.com/snap/v2/vtweb/example") {
+		t.Fatal("sandbox Snap redirect should be accepted")
+	}
+	for _, rawURL := range []string{
+		"http://app.sandbox.midtrans.com/snap",
+		"https://app.midtrans.com/snap",
+		"https://app.sandbox.midtrans.com.attacker.example/snap",
+	} {
+		if validMidtransRedirectURL(rawURL) {
+			t.Errorf("validMidtransRedirectURL(%q) = true, want false", rawURL)
+		}
+	}
+}
+
+func TestCanAnswerCampaignQuestions(t *testing.T) {
+	tests := []struct {
+		name    string
+		user    User
+		ownerID sql.NullInt64
+		want    bool
+	}{
+		{name: "campaign owner with donor role", user: User{ID: 7, Role: "DONATUR"}, ownerID: sql.NullInt64{Int64: 7, Valid: true}, want: true},
+		{name: "campaign owner with manager role", user: User{ID: 7, Role: "PENGELOLA"}, ownerID: sql.NullInt64{Int64: 7, Valid: true}, want: true},
+		{name: "admin", user: User{ID: 9, Role: "ADMIN"}, ownerID: sql.NullInt64{Int64: 7, Valid: true}, want: true},
+		{name: "other user", user: User{ID: 8, Role: "DONATUR"}, ownerID: sql.NullInt64{Int64: 7, Valid: true}, want: false},
+		{name: "campaign has no owner", user: User{ID: 7, Role: "DONATUR"}, want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := canAnswerCampaignQuestions(test.user, test.ownerID); got != test.want {
+				t.Fatalf("canAnswerCampaignQuestions() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
 
 func TestDetectCampaignMediaType(t *testing.T) {
 	tests := []struct {
@@ -79,6 +199,57 @@ func TestCreateCampaignRequiresPhoto(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), "minimal 1 foto") {
 		t.Fatalf("response = %q, want required-photo message", response.Body.String())
+	}
+}
+
+func TestUploadCampaignMediaRequiresPhoto(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/campaigns/1/media", &body)
+	request.SetPathValue("campaignID", "1")
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	request = request.WithContext(context.WithValue(request.Context(), userKey, User{ID: 1, Role: "DONATUR"}))
+	response := httptest.NewRecorder()
+
+	uploadCampaignMedia(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+	if !strings.Contains(response.Body.String(), "minimal 1 foto") {
+		t.Fatalf("response = %q, want required-photo message", response.Body.String())
+	}
+}
+
+func TestCreateCampaignFundUpdateRequiresManagerRole(t *testing.T) {
+	tests := []struct {
+		name       string
+		user       interface{}
+		wantStatus int
+	}{
+		{name: "unauthenticated", wantStatus: http.StatusUnauthorized},
+		{name: "donor", user: User{ID: 1, Role: "DONATUR"}, wantStatus: http.StatusForbidden},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/campaigns/1/fund-updates", strings.NewReader(""))
+			request.SetPathValue("campaignID", "1")
+			if test.user != nil {
+				request = request.WithContext(context.WithValue(request.Context(), userKey, test.user))
+			}
+			response := httptest.NewRecorder()
+
+			createCampaignFundUpdate(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
+			}
+		})
 	}
 }
 

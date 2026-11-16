@@ -1,0 +1,8 @@
+ALTER TABLE donations
+  ADD COLUMN IF NOT EXISTS donor_user_id BIGINT REFERENCES users(id);
+ALTER TABLE donations
+  ADD COLUMN IF NOT EXISTS donor_email VARCHAR(150);
+ALTER TABLE donations
+  ADD COLUMN IF NOT EXISTS donor_phone VARCHAR(30);
+ALTER TABLE donations
+  ADD COLUMN IF NOT EXISTS payment_url TEXT;

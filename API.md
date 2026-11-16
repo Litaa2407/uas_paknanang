@@ -15,7 +15,19 @@ Semua request browser diarahkan melalui API Gateway. Campaign Service dan Notifi
 | POST | `/auth/register` | Tidak | Registrasi akun DONATUR |
 | POST | `/auth/login` | Tidak | Login dan penerbitan JWT pengguna |
 | POST | `/graphql` | Bergantung operasi | Query/mutation campaign |
-| POST | `/webhook/payment` | HMAC signature | Penerimaan event pembayaran |
+| POST | `/campaigns` | Wajib | Mengajukan campaign dengan foto dan video (multipart legacy) |
+| POST | `/campaigns/{campaignID}/media` | Wajib | Menambahkan foto/video ke campaign yang masih menunggu persetujuan |
+| GET | `/campaigns/{campaignID}/media/{mediaID}` | Opsional | Mengambil media campaign aktif atau selesai |
+| POST | `/campaigns/{campaignID}/fund-updates` | PENGELOLA pemilik campaign atau ADMIN | Mencatat penggunaan dana, dengan foto bukti opsional |
+| GET | `/campaigns/{campaignID}/fund-updates/{updateID}/evidence` | Opsional | Mengambil foto bukti update campaign aktif atau selesai |
+| POST | `/donations` | DONATUR | Membuat pembayaran Midtrans Snap Sandbox |
+| GET | `/donations/mine` | DONATUR | Melihat riwayat donasi dan progres campaign milik sendiri |
+| GET | `/donations/pending?campaign_id={id}` | DONATUR | Mengambil checkout pending milik donatur untuk dilanjutkan |
+| POST | `/donations/{reference}/cancel` | Pemilik transaksi | Membatalkan checkout pending di Midtrans |
+| GET | `/donations/{reference}/status` | Pemilik transaksi | Memeriksa dan menyinkronkan status pembayaran dari Midtrans |
+| POST | `/donations/simulate` | DONATUR | Mencatat donasi simulasi |
+| POST | `/webhook/midtrans` | Signature Midtrans | Notifikasi transaksi Midtrans |
+| POST | `/webhook/payment` | HMAC signature | Notifikasi pembayaran simulasi |
 | GET | `/ws/donasi` | Internal Gateway token | WebSocket notifikasi real-time |
 
 Header `X-Internal-Token` tidak boleh dikirim atau dibuat oleh browser. Header tersebut dibuat oleh Gateway setelah memperoleh OAuth2 access token dan hanya digunakan pada jaringan internal.
@@ -109,7 +121,7 @@ Request:
 }
 ```
 
-Response sukses memiliki bentuk yang sama dengan registrasi. JWT pengguna berlaku 12 jam dan ditandatangani menggunakan HS256. Password disimpan sebagai bcrypt hash.
+Response sukses memiliki bentuk yang sama dengan registrasi. JWT pengguna berlaku 12 jam dan ditandatangani menggunakan HS256. Frontend mengakhiri sesi dan meminta login kembali saat JWT kedaluwarsa, termasuk ketika aplikasi dibuka kembali setelah masa berlaku token habis. Password disimpan sebagai bcrypt hash.
 
 Status error umum: `400 Bad Request` untuk JSON tidak valid dan `401 Unauthorized` untuk kredensial yang salah.
 
@@ -167,6 +179,53 @@ query {
 
 Mengembalikan `null` jika campaign tidak ditemukan atau belum aktif.
 
+Detail campaign juga menyediakan `questions`, `fundUpdates`, `donors`, `donorCount`, dan `canManage`. Daftar donatur tidak membuka nama maupun kontak; setiap entri ditampilkan sebagai “Donatur”.
+
+```graphql
+query {
+  campaign(id: 1) {
+    canManage
+    donorCount
+    questions { id question askedByName createdAt answer answeredByName answeredAt }
+    fundUpdates { id amount purpose description createdByName createdAt hasEvidence evidenceContentType }
+    donors { name amount createdAt }
+  }
+}
+```
+
+### Mutation: bertanya tentang campaign (DONATUR)
+
+```graphql
+mutation {
+  askCampaignQuestion(campaignID: 1, question: "Bagaimana rencana penggunaan dana campaign ini?") {
+    id
+    question
+    createdAt
+  }
+}
+```
+
+Wajib JWT role `DONATUR`; pertanyaan berisi 10–2.000 karakter. Nama dan kontak penanya tidak dipublikasikan.
+
+### Mutation: menjawab pertanyaan (PENGELOLA pemilik campaign atau ADMIN)
+
+```graphql
+mutation {
+  answerCampaignQuestion(questionID: 1, answer: "Dana akan digunakan untuk kebutuhan yang dijelaskan dalam campaign.") {
+    id
+    answer
+    answeredByName
+    answeredAt
+  }
+}
+```
+
+Setiap pertanyaan hanya dapat dijawab satu kali.
+
+### Mencatat penggunaan dana (PENGELOLA pemilik campaign atau ADMIN)
+
+Kirim `multipart/form-data` ke `POST /campaigns/{campaignID}/fund-updates` dengan JWT pengguna. Field `amount` berupa bilangan positif; `purpose` berisi 3–120 karakter dan `description` 5–2.000 karakter. Field `evidence` opsional berupa satu foto JPG, PNG, atau WebP, maksimal 5 MiB. Total request maksimal 6 MiB. Nominal update tidak boleh melebihi dana terkumpul yang belum dilaporkan penggunaannya. Update hanya dapat ditambahkan ke campaign aktif.
+
 ### Query: campaign menunggu persetujuan (ADMIN)
 
 ```graphql
@@ -178,11 +237,35 @@ query {
     target
     collected
     status
+    submittedByName
+    submittedByEmail
+    createdAt
   }
 }
 ```
 
 Wajib menyertakan JWT pengguna dengan role `ADMIN`.
+
+### Query: detail campaign menunggu persetujuan (ADMIN)
+
+```graphql
+query {
+  pendingCampaign(id: 1) {
+    id
+    title
+    description
+    target
+    collected
+    status
+    submittedByName
+    submittedByEmail
+    createdAt
+    media { id mediaType contentType }
+  }
+}
+```
+
+Query ini hanya mengembalikan campaign berstatus `MENUNGGU` dan hanya dapat diakses oleh ADMIN. Halaman detail menampilkan cerita lengkap, media, identitas pengaju, waktu pengajuan, dan target donasi.
 
 ### Mutation: membuat campaign (pengguna login)
 
@@ -208,6 +291,8 @@ Header:
 Authorization: Bearer <JWT_ACCESS_TOKEN>
 ```
 
+Frontend mengirim mutation GraphQL ini terlebih dahulu, lalu mengunggah media ke `POST /campaigns/{campaignID}/media` menggunakan `multipart/form-data` dan JWT yang sama. Pilih minimal satu foto; maksimal lima foto (JPG, PNG, atau WebP, masing-masing maksimal 5 MB) dan satu video MP4 opsional (maksimal 25 MB). Total request maksimal 50 MB. Media hanya dapat ditambahkan oleh pemilik campaign atau ADMIN selama status campaign masih `MENUNGGU`.
+
 ### Mutation: menyetujui campaign (ADMIN)
 
 ```graphql
@@ -227,9 +312,116 @@ Wajib JWT role `ADMIN`. Campaign berubah dari `MENUNGGU` menjadi `AKTIF`.
 - GraphQL mengembalikan HTTP `200` untuk hasil eksekusi yang dapat berisi properti `errors`; client tetap harus memeriksa `errors`.
 - Body request dibatasi maksimal 1 MiB.
 - Pemeriksaan kompleksitas dasar menolak query dengan lebih dari 12 pembuka selection set.
-- Query `campaigns` dan `campaign` bersifat publik; `pendingCampaigns` dan mutation memiliki pemeriksaan role sesuai aturan di atas.
+- Query `campaigns` dan `campaign` bersifat publik; `pendingCampaigns` dan mutation memiliki pemeriksaan autentikasi/role sesuai aturan di atas.
+- Tabel pertanyaan dan update penggunaan dana disiapkan otomatis secara idempoten saat Campaign Service mulai. SQL yang sama tersedia di `db/migrations/004_campaign_engagement.sql`.
 
-## 6. Payment webhook
+## 6. Pengajuan campaign dengan media
+
+### `POST /campaigns`
+
+Frontend mengirim `multipart/form-data` dengan JWT pengguna:
+
+```http
+Authorization: Bearer <JWT_ACCESS_TOKEN>
+Content-Type: multipart/form-data
+```
+
+Field form:
+
+| Field | Bentuk | Aturan |
+|---|---|---|
+| `title` | teks | 3–100 karakter |
+| `description` | teks | Maksimal 10.000 karakter |
+| `target` | angka | Bilangan positif |
+| `photos` | file berulang | Wajib 1–5 file JPG, PNG, atau WebP; maksimal 5 MiB per file |
+| `video` | file opsional | Maksimal 1 file MP4; maksimal 25 MiB |
+
+Total upload maksimal 50 MiB. Campaign baru berstatus `MENUNGGU`. Response `201 Created` berisi object campaign (`id`, `title`, `description`, `target`, `collected`, `status`). Event `CAMPAIGN_CREATED` diterbitkan melalui transactional outbox.
+
+### `GET /campaigns/{campaignID}/media/{mediaID}`
+
+Media campaign `AKTIF` dapat diakses publik dan dikirim inline dengan Content-Type yang tersimpan. Media campaign yang belum aktif hanya tersedia bagi pemilik atau ADMIN dengan JWT; selain itu endpoint mengembalikan `404`.
+
+## 7. Pembayaran donasi
+
+### `POST /donations`
+
+Membuat transaksi Midtrans Snap Sandbox. Hanya akun `DONATUR` yang dapat membuat pembayaran. Server Key disimpan di Campaign Service melalui `MIDTRANS_SERVER_KEY` dan tidak pernah dikirim ke browser.
+
+Request memakai JWT dan format yang sama dengan endpoint simulasi:
+
+```json
+{
+  "campaign_id": 1,
+  "amount": 25000,
+  "donor_name": "Donatur Uji",
+  "donor_email": "donatur@example.com",
+  "donor_phone": "+6281234567890"
+}
+```
+
+Nominal minimum Rp 1.000; campaign harus berstatus `AKTIF`. Transaksi dicatat sebagai `PENDING` sebelum request ke Midtrans. Response `201 Created` berisi referensi dan `redirect_url` Snap Sandbox. Frontend mengarahkan donatur ke halaman pembayaran Midtrans; Snap menyediakan metode pembayaran yang aktif pada akun merchant, termasuk QRIS dan Virtual Account.
+
+```json
+{
+  "status": "PENDING",
+  "reference": "DON-<random>",
+  "redirect_url": "https://app.sandbox.midtrans.com/snap/v2/..."
+}
+```
+
+### `GET /donations/{reference}/status`
+
+Hanya pemilik transaksi yang terautentikasi sebagai `DONATUR` yang dapat memeriksa status. Campaign Service mengambil status terbaru dari Midtrans Sandbox dan memvalidasi order serta nominal sebelum memperbarui database. Progres campaign bertambah satu kali saja setelah pembayaran terkonfirmasi. Browser tidak dapat menetapkan status transaksi sendiri.
+
+### `GET /donations/pending?campaign_id={id}`
+
+Mengembalikan maksimal lima checkout berstatus `PENDING` milik donatur yang sedang login untuk campaign tersebut. Endpoint tidak mengembalikan transaksi pengguna lain. Frontend menampilkan tombol **Lanjutkan pembayaran** yang membuka kembali Snap checkout menggunakan tautan transaksi yang sama. Tautan disimpan hanya di backend dan hanya dikembalikan ke pemilik pembayaran.
+
+### `GET /donations/mine`
+
+Mengembalikan riwayat transaksi milik Donatur yang sedang login beserta nominal, status, tanggal, dan progres terbaru campaign (dana terkumpul dan target). Endpoint ini hanya membaca data transaksi yang terikat dengan ID pengguna dari token.
+
+### `POST /donations/{reference}/cancel`
+
+Hanya pemilik transaksi yang terautentikasi sebagai `DONATUR` yang dapat membatalkan pembayaran. Campaign Service memeriksa status transaksi ke Midtrans, meminta pembatalan untuk transaksi yang masih `PENDING`, lalu memverifikasi statusnya kembali sebelum menandainya `FAILED`. Jika pembayaran sudah berhasil, status `SETTLEMENT` tetap dipertahankan dan donasi tetap tercatat. Pembatalan tidak menghapus riwayat transaksi.
+
+### `POST /webhook/midtrans`
+
+Endpoint notifikasi Midtrans. Validasi `signature_key` menggunakan SHA-512 atas gabungan `order_id + status_code + gross_amount + MIDTRANS_SERVER_KEY`, kemudian Campaign Service mengambil status langsung dari API Midtrans sebelum mengubah transaksi. Pada pengembangan lokal, endpoint ini tidak dapat menerima notifikasi internet tanpa URL publik; halaman kembali tetap memeriksa status lewat API status server.
+
+Gunakan Sandbox Server Key dari dashboard Midtrans. Tambahkan nilainya secara lokal ke `.env` sebagai `MIDTRANS_SERVER_KEY` (jangan commit atau kirim key ke chat), lalu rebuild service:
+
+```powershell
+docker compose up -d --build --force-recreate campaign-service campaign-service-2 frontend gateway
+```
+
+Jangan gunakan Server Key Sandbox untuk pembayaran uang sungguhan. Integrasi ini diarahkan ke endpoint Sandbox.
+
+### `POST /donations/simulate`
+
+Hanya akun `DONATUR` yang dapat mencatat dukungan simulasi. Kirim JWT pengguna:
+
+```http
+Authorization: Bearer <JWT_ACCESS_TOKEN>
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{
+  "campaign_id": 1,
+  "amount": 25000,
+  "donor_name": "Donatur Uji",
+  "donor_email": "donatur@example.com",
+  "donor_phone": "+6281234567890"
+}
+```
+
+Campaign harus berstatus `AKTIF`; nominal minimum Rp 1.000. Ketika dana terkumpul mencapai target, status campaign berubah menjadi `SELESAI` dan campaign tidak menerima donasi baru. Nama, email, dan nomor telepon divalidasi dan disimpan bersama catatan donasi, tetapi tidak disebarkan pada event publik. Response `200 OK` berisi `{"status":"simulated","reference":"SIM-..."}`. Progres campaign dan event `SIMULATED_DONATION` dicatat secara transaksional.
+
+## 8. Webhook simulasi
 
 ### `POST /webhook/payment`
 
@@ -268,16 +460,18 @@ Response sukses `202 Accepted`:
 
 Status error umum: `400 Bad Request` untuk payload/signature tidak valid, `401 Unauthorized` untuk HMAC tidak valid, `404 Not Found` jika campaign settlement tidak ditemukan, dan `409 Conflict` untuk reference duplikat atau data yang melanggar constraint.
 
-Webhook saat ini adalah simulasi. Integrasi payment gateway sesungguhnya harus mengikuti format signature, retry, dan payload resmi provider terkait.
+Endpoint ini hanya untuk simulasi pengujian internal; pembayaran Midtrans memakai `POST /webhook/midtrans`.
 
-## 7. WebSocket notifikasi
+## 9. WebSocket notifikasi
 
 ### `GET /ws/donasi`
 
 URL browser lokal:
 
 ```javascript
-const socket = new WebSocket('ws://localhost:8000/ws/donasi');
+const socketURL = new URL('/ws/donasi', window.location.href);
+socketURL.protocol = socketURL.protocol === 'https:' ? 'wss:' : 'ws:';
+const socket = new WebSocket(socketURL);
 socket.onmessage = (message) => {
   const event = JSON.parse(message.data);
   console.log(event);
@@ -315,9 +509,21 @@ Contoh pesan donasi:
 }
 ```
 
+Donasi simulasi yang dikirim dari frontend menggunakan `SIMULATED_DONATION` dan tidak menyertakan data kontak:
+
+```json
+{
+  "event_id": 12,
+  "event": "SIMULATED_DONATION",
+  "campaign_id": 1,
+  "donor_name": "Donatur",
+  "amount": 25000
+}
+```
+
 WebSocket hanya mengirim notifikasi aktivitas kepada client yang sedang tersambung. Event history tersimpan pada tabel outbox untuk status publish, bukan sebagai API riwayat notifikasi.
 
-## 8. OAuth2 internal (Gateway ke backend)
+## 10. OAuth2 internal (Gateway ke backend)
 
 OAuth2 Client Credentials digunakan untuk autentikasi service-to-service, bukan login pengguna.
 
@@ -346,7 +552,7 @@ Gateway menyimpan token hingga mendekati waktu kedaluwarsa dan memperbaruinya ot
 
 Backend memeriksa signature HS256, issuer, audience, subject client, scope, dan masa berlaku token. Endpoint backend selain `/health` dan `/oauth/token` juga mensyaratkan sertifikat client mTLS dengan Common Name `gateway` ketika `MTLS_ENABLED=true`.
 
-## 9. Message queue dan transactional outbox
+## 11. Message queue dan transactional outbox
 
 Campaign Service menyimpan perubahan data dan event outbox dalam transaksi PostgreSQL yang sama. Worker membaca event berdasarkan ID dengan advisory transaction lock PostgreSQL agar satu publisher memproses urutan event, lalu memublikasikannya ke exchange RabbitMQ `crowdfunding.events` dengan delivery mode persistent dan publisher confirmation.
 
@@ -358,7 +564,7 @@ Campaign Service menyimpan perubahan data dan event outbox dalam transaksi Postg
 
 Notification Service membuat queue durable `notification.events`, binding `#`, mengonsumsi pesan dengan manual acknowledgement, lalu broadcast payload JSON ke WebSocket. Pesan membawa `event_id` untuk membantu deteksi duplikasi. Pola pengiriman adalah at-least-once, bukan exactly-once.
 
-## 10. Status code
+## 12. Status code
 
 | Status | Makna umum |
 |---|---|
@@ -372,7 +578,7 @@ Notification Service membuat queue durable `notification.events`, binding `#`, m
 | `500 Internal Server Error` | Kegagalan internal atau database |
 | `503 Service Unavailable` | Upstream tidak sehat atau autentikasi service tidak tersedia |
 
-## 11. Catatan keamanan
+## 13. Catatan keamanan
 
 - Jangan mengirim `JWT_SECRET`, `PAYMENT_WEBHOOK_SECRET`, `OAUTH_CLIENT_SECRET`, password DB, atau RabbitMQ credentials ke browser.
 - Jangan memanggil port backend secara langsung dari client. Gunakan Gateway.
