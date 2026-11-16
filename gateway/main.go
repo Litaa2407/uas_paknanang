@@ -339,28 +339,16 @@ func main() {
 			"notification": notification.Status(),
 		})
 	})
-<<<<<<< HEAD
-
-	// Routing ke Campaign Service
-	mux.Handle("/auth/", proxy(campaign))
-	mux.Handle("/graphql", proxy(campaign))
-	mux.Handle("/campaigns", proxy(campaign))
-	mux.Handle("/campaigns/", proxy(campaign))
-	mux.Handle("/donations/", proxy(campaign))
-	mux.Handle("/webhook/", proxy(campaign))
-
-	// Routing ke Notification Service
-	mux.Handle("/ws/", proxy(notif))
-
-	// Halaman utama Gateway
-=======
 	campaignProxy := proxy(campaign, transport, tokens)
 	notificationProxy := proxy(notification, transport, tokens)
 	mux.Handle("/auth/", campaignProxy)
 	mux.Handle("/graphql", campaignProxy)
+	mux.Handle("/campaigns", campaignProxy)
+	mux.Handle("/campaigns/", campaignProxy)
+	mux.Handle("/donations", campaignProxy)
+	mux.Handle("/donations/", campaignProxy)
 	mux.Handle("/webhook/", campaignProxy)
 	mux.Handle("/ws/", notificationProxy)
->>>>>>> 968f0cd15ad87da8ddedc6237390d4e90e17b000
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"service": "Crowdfunding API Gateway", "group": "Kelompok E"})
 	})
