@@ -143,6 +143,9 @@ services:
 
   frontend:
     build: ./frontend
+    environment:
+      PORT: "80"
+      GATEWAY_HOST: gateway:8000
     ports:
       - "5173:80"
     depends_on: [gateway]

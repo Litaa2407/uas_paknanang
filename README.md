@@ -39,6 +39,47 @@ docker compose up -d --build --force-recreate campaign-service campaign-service-
 
 Untuk menguji pembayaran, buat akun Midtrans Sandbox dan isi `MIDTRANS_SERVER_KEY` pada `.env` dengan Server Key Sandbox. Key hanya digunakan Campaign Service; jangan commit atau bagikan key. Aktifkan izin **Cancel transaction: Write** agar pembatalan checkout dapat diteruskan ke Midtrans. Checkout akan mengarahkan donatur ke Snap Sandbox dan tidak memotong uang sungguhan. Jika checkout ditinggalkan saat belum selesai, pemilik donasi dapat melanjutkan atau membatalkannya dari detail campaign atau halaman donasi. Detail endpoint ada di [API.md](./API.md).
 
+## Deploy ke Railway
+
+Source code tetap di satu repository, tetapi Railway menjalankan komponen sebagai service terpisah dalam satu project. Buat satu service untuk masing-masing folder aplikasi di tabel berikut. Mulai dengan satu Campaign Service; replika kedua dari Docker Compose tidak wajib untuk deployment awal.
+
+| Service Railway | Root Directory | Tipe / akses | Port aplikasi |
+|---|---|---|---:|
+| `frontend` | `/frontend` | Public Web Service | Railway `PORT` |
+| `gateway` | `/gateway` | Private Service | `8000` |
+| `campaign-service` | `/campaign-service` | Private Service | `8443` |
+| `notification-service` | `/notification-service` | Private Service | `8443` |
+| `Postgres` | — | Tambahkan plugin PostgreSQL Railway | internal |
+| `rabbitmq` | — | Private service dari image `rabbitmq:3-management-alpine` | `5672` internal |
+
+Semua service harus berada di project dan environment Railway yang sama. Pada service Docker dari repository, atur **Root Directory** sesuai tabel agar Dockerfile di folder tersebut digunakan. Buat domain publik hanya untuk `frontend`; gateway dan kedua backend tetap private. Railway private networking menggunakan hostname internal dan koneksi antar-service tanpa membuka port backend ke internet.
+
+### Urutan setup
+
+1. Buat project Railway dan hubungkan repository GitHub ini. Periksa billing dan batas penggunaan sebelum deploy; PostgreSQL, RabbitMQ, dan service aplikasi merupakan resource terpisah.
+2. Tambahkan PostgreSQL Railway, lalu jalankan isi [`db/init.sql`](./db/init.sql) sekali terhadap database yang baru dibuat. Jangan jalankan skrip ini pada database berisi data tanpa backup.
+3. Tambahkan `rabbitmq` dari image `rabbitmq:3-management-alpine`. Set `RABBITMQ_DEFAULT_USER` dan `RABBITMQ_DEFAULT_PASS` memakai kredensial acak alfanumerik, lalu pasang volume ke `/var/lib/rabbitmq`. Jangan buat domain publik atau TCP proxy untuk RabbitMQ.
+4. Buat tiga private service dari repo dengan root directory `/campaign-service`, `/notification-service`, dan `/gateway`. Set variabel sesuai tabel di bawah.
+5. Buat service `/frontend`, atur `GATEWAY_HOST` seperti tabel, lalu aktifkan public domain. Nginx membaca `PORT` dan `GATEWAY_HOST` saat container mulai, lalu meneruskan API dan WebSocket melalui jaringan private.
+6. Tunggu semua deployment sehat. Buat atau aktifkan akun Admin melalui SQL Railway hanya jika diperlukan; jangan membuka SQL admin ke internet.
+7. Untuk Midtrans, isi callback/notification URL Sandbox dengan `https://<domain-frontend>/webhook/midtrans`. Gunakan Server Key Sandbox terlebih dahulu; jangan aktifkan transaksi uang sungguhan sebelum konfigurasi produksi dan pengujian selesai.
+
+### Variabel Railway
+
+Buat variabel rahasia bersama (shared variables) `JWT_SECRET` dan `OAUTH_CLIENT_SECRET` dengan nilai acak minimal 32 karakter; gunakan nilai yang sama pada service terkait. Jangan menyalin `.env` lokal ke repository atau menaruh secret di file konfigurasi.
+
+| Service | Variabel |
+|---|---|
+| `campaign-service` | `PORT=8443`, `MTLS_ENABLED=false`, `DATABASE_URL=${{Postgres.DATABASE_URL}}`, `JWT_SECRET=${{shared.JWT_SECRET}}`, `PAYMENT_WEBHOOK_SECRET=<secret acak minimal 32 karakter>`, `OAUTH_CLIENT_ID=crowdfunding-gateway`, `OAUTH_CLIENT_SECRET=${{shared.OAUTH_CLIENT_SECRET}}`, `FRONTEND_URL=https://${{frontend.RAILWAY_PUBLIC_DOMAIN}}`, `RABBITMQ_URL=amqp://${{shared.RABBITMQ_USER}}:${{shared.RABBITMQ_PASSWORD}}@${{rabbitmq.RAILWAY_PRIVATE_DOMAIN}}:5672/`, `MIDTRANS_SERVER_KEY=<Server Key Sandbox milikmu>` |
+| `notification-service` | `PORT=8443`, `MTLS_ENABLED=false`, `JWT_SECRET=${{shared.JWT_SECRET}}`, `OAUTH_CLIENT_ID=crowdfunding-gateway`, `RABBITMQ_URL` sama seperti di atas, `CORS_ALLOWED_ORIGINS=https://${{frontend.RAILWAY_PUBLIC_DOMAIN}}` |
+| `gateway` | `PORT=8000`, `MTLS_ENABLED=false`, `OAUTH_CLIENT_ID=crowdfunding-gateway`, `OAUTH_CLIENT_SECRET=${{shared.OAUTH_CLIENT_SECRET}}`, `CAMPAIGN_SERVICES=http://${{campaign-service.RAILWAY_PRIVATE_DOMAIN}}:8443`, `NOTIFICATION_SERVICE=http://${{notification-service.RAILWAY_PRIVATE_DOMAIN}}:8443`, `CORS_ALLOWED_ORIGINS=https://${{frontend.RAILWAY_PUBLIC_DOMAIN}}` |
+| `frontend` | `GATEWAY_HOST=${{gateway.RAILWAY_PRIVATE_DOMAIN}}:8000`; Railway menyediakan `PORT` untuk HTTP service |
+| `rabbitmq` | `RABBITMQ_DEFAULT_USER=${{shared.RABBITMQ_USER}}`, `RABBITMQ_DEFAULT_PASS=${{shared.RABBITMQ_PASSWORD}}` |
+
+Tambahkan juga `RABBITMQ_USER` dan `RABBITMQ_PASSWORD` sebagai shared variables acak alfanumerik, dan referensikan nama service secara persis seperti di tabel. `MTLS_ENABLED=false` digunakan karena koneksi antar-service Railway berjalan melalui private networking; autentikasi service OAuth tetap aktif. Jangan gunakan kredensial, URL database, atau server key yang sama dengan contoh lokal.
+
+Dokumentasi Railway: [Deploying a Monorepo](https://docs.railway.com/deployments/monorepo), [Private Networking](https://docs.railway.com/networking/private-networking), dan [Variables](https://docs.railway.com/variables/reference).
+
 Untuk menghentikan container tanpa menghapus data database:
 
 ```bash
